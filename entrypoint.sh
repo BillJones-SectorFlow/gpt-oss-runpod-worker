@@ -10,7 +10,7 @@
 # but it's safer to explicitly set a key for internal communication if it's enabled.
 # If OpenWebUI is configured to require an API key, this environment variable will provide it.
 # The actual key can be anything, as it's for internal communication within the secure RunPod environment.
-export OPENWEBUI_API_KEY="rp-tutel-internal-key"
+export WEBUI_SECRET_KEY="rp-tutel-internal-key"
 
 /opt/deepseek-tutel-accel/run.sh --serve=webui --listen_port 8000 --try_path /runpod-volume/models/gpt-oss-120b & 
 
