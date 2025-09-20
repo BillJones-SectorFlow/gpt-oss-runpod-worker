@@ -2,6 +2,7 @@
 import os
 import logging
 import httpx
+import uvicorn
 from fastapi import FastAPI, Request, Response, status, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
