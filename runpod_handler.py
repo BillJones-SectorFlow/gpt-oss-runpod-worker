@@ -48,14 +48,17 @@ INPUT_SCHEMA = {
 def handler(job):
     job_input = job['input']
     log.info(f"Received job: {job['id']}")
-    log.debug(f"Job input: {job_input}")
+    log.debug(f"Raw job input: {job_input}")
 
     # Validate the input against the schema
     validated_input = validate(job_input, INPUT_SCHEMA)
     if 'errors' in validated_input:
         log.error(f"Validation errors: {validated_input['errors']}")
         return {"error": validated_input['errors']}
-    job_input = validated_input['validated_input']
+    
+    # The validated input is now directly the OpenAI API payload
+    openai_payload = validated_input['validated_input']
+    log.debug(f"OpenAI payload extracted: {openai_payload}")
 
     # Prepare headers, including the API key if available
     headers = {"Content-Type": "application/json"}
@@ -65,13 +68,13 @@ def handler(job):
     # Forward the request directly to the OpenWebUI API
     try:
         log.info("Forwarding request to OpenWebUI...")
-        if job_input.get('stream', False):
+        if openai_payload.get('stream', False):
             # For streaming, we need to return a generator that yields the chunks.
             # RunPod's serverless worker will handle the streaming back to the client.
             def stream_generator():
                 with requests.post(
                     OPENWEBUI_INTERNAL_API_URL,
-                    json=job_input,
+                    json=openai_payload,
                     headers=headers,
                     stream=True,
                     timeout=600
@@ -86,7 +89,7 @@ def handler(job):
             # Handle non-streaming response
             response = requests.post(
                 OPENWEBUI_INTERNAL_API_URL,
-                json=job_input,
+                json=openai_payload,
                 headers=headers,
                 timeout=600
             )
@@ -94,6 +97,8 @@ def handler(job):
             result = response.json()
             log.info("Received non-streaming response from OpenWebUI.")
             log.debug(f"OpenWebUI response: {result}")
+            # The key insight from the vLLM worker is that the final output needs to be a dictionary
+            # with a specific structure. For non-streaming, it should be `{"output": result}`.
             return {"output": result}
 
     except requests.exceptions.RequestException as e:
