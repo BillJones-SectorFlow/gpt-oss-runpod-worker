@@ -1,16 +1,19 @@
+import os
+import logging
+import requests
 import runpod
 from runpod.serverless.utils.rp_validator import validate
-import requests
-import os
-import json
-import time
+
+# Configure logging
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+log = logging.getLogger(__name__)
 
 # The internal OpenWebUI is expected to run on port 8000 within the container
-# and exposes an OpenAI-compatible API at /api/chat/completions
-OPENWEBUI_INTERNAL_API_URL = os.getenv("OPENWEBUI_INTERNAL_API_URL", "http://localhost:8000/api/chat/completions")
+# and exposes an OpenAI-compatible API at /v1/chat/completions
+OPENWEBUI_INTERNAL_API_URL = os.getenv("OPENWEBUI_INTERNAL_API_URL", "http://localhost:8000/v1/chat/completions")
 
 # Retrieve the internal API key set in the entrypoint.sh
-OPENWEBUI_API_KEY = os.getenv("OPENWEBUI_API_KEY")
+WEBUI_SECRET_KEY = os.getenv("WEBUI_SECRET_KEY")
 
 # Schema for validating the input payload
 INPUT_SCHEMA = {
@@ -44,33 +47,41 @@ INPUT_SCHEMA = {
 
 def handler(job):
     job_input = job['input']
+    log.info(f"Received job: {job['id']}")
+    log.debug(f"Job input: {job_input}")
 
     # Validate the input against the schema
     validated_input = validate(job_input, INPUT_SCHEMA)
     if 'errors' in validated_input:
+        log.error(f"Validation errors: {validated_input['errors']}")
         return {"error": validated_input['errors']}
     job_input = validated_input['validated_input']
 
     # Prepare headers, including the API key if available
     headers = {"Content-Type": "application/json"}
     if OPENWEBUI_API_KEY:
-        headers["Authorization"] = f"Bearer {OPENWEBUI_API_KEY}"
+        headers["Authorization"] = f"Bearer {WEBUI_SECRET_KEY}"
 
     # Forward the request directly to the OpenWebUI API
     try:
+        log.info("Forwarding request to OpenWebUI...")
         if job_input.get('stream', False):
-            # For streaming, we need to return the raw response content as RunPod will handle the SSE parsing.
-            # The `stream=True` in requests.post is crucial for this.
-            response = requests.post(
-                OPENWEBUI_INTERNAL_API_URL,
-                json=job_input,
-                headers=headers,
-                stream=True,
-                timeout=600
-            )
-            response.raise_for_status()
-            # RunPod expects the raw text content for streaming.
-            return {"output": response.text, "is_stream": True}
+            # For streaming, we need to return a generator that yields the chunks.
+            # RunPod's serverless worker will handle the streaming back to the client.
+            def stream_generator():
+                with requests.post(
+                    OPENWEBUI_INTERNAL_API_URL,
+                    json=job_input,
+                    headers=headers,
+                    stream=True,
+                    timeout=600
+                ) as response:
+                    response.raise_for_status()
+                    log.info("Streaming response from OpenWebUI...")
+                    for chunk in response.iter_content(chunk_size=8192):
+                        log.debug(f"Yielding chunk: {chunk}")
+                        yield chunk
+            return stream_generator()
         else:
             # Handle non-streaming response
             response = requests.post(
@@ -80,11 +91,16 @@ def handler(job):
                 timeout=600
             )
             response.raise_for_status()  # Raise an exception for HTTP errors
-            return response.json()
+            result = response.json()
+            log.info("Received non-streaming response from OpenWebUI.")
+            log.debug(f"OpenWebUI response: {result}")
+            return {"output": result}
 
     except requests.exceptions.RequestException as e:
+        log.error(f"Failed to communicate with internal OpenWebUI service: {e}")
         return {"error": f"Failed to communicate with internal OpenWebUI service: {e}"}
     except Exception as e:
+        log.error(f"An unexpected error occurred in handler: {e}")
         return {"error": f"An unexpected error occurred in handler: {e}"}
 
 runpod.serverless.start({"handler": handler})
