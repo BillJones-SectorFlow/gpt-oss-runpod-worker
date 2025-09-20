@@ -1,12 +1,22 @@
+
 import os
 import logging
-import requests
-import runpod
-from runpod.serverless.utils.rp_validator import validate
+import httpx
+from fastapi import FastAPI, Request, Response, status, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field, ValidationError
+from typing import List, Dict, Any, Optional
+from contextlib import asynccontextmanager
 
 # Configure logging
-logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
-log = logging.getLogger(__name__)
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # The internal OpenWebUI is expected to run on port 8000 within the container
 # and exposes an OpenAI-compatible API at /v1/chat/completions
@@ -15,97 +25,132 @@ OPENWEBUI_INTERNAL_API_URL = os.getenv("OPENWEBUI_INTERNAL_API_URL", "http://loc
 # Retrieve the internal API key set in the entrypoint.sh
 WEBUI_SECRET_KEY = os.getenv("WEBUI_SECRET_KEY")
 
-# Schema for validating the input payload
-INPUT_SCHEMA = {
-    'model': {
-        'type': str,
-        'required': True
-    },
-    'messages': {
-        'type': list,
-        'required': True,
-        'min_length': 1
-    },
-    'temperature': {
-        'type': float,
-        'required': False,
-        'default': 1.0,
-        'constraints': [lambda temp: 0.0 <= temp <= 2.0, 'Temperature must be between 0.0 and 2.0']
-    },
-    'max_tokens': {
-        'type': int,
-        'required': False,
-        'default': 32768,
-        'constraints': [lambda tokens: tokens > 0, 'Max tokens must be greater than 0']
-    },
-    'stream': {
-        'type': bool,
-        'required': False,
-        'default': False
+# --- FastAPI Application Setup ---
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("FastAPI application startup.")
+    # Any startup tasks can go here. For now, just logging.
+    yield
+    logger.info("FastAPI application shutdown.")
+    # Any shutdown tasks can go here.
+
+app = FastAPI(title="OpenWebUI Proxy Load Balancer", version="1.0.0", lifespan=lifespan)
+
+# --- Pydantic Models for Request Validation ---
+
+class Message(BaseModel):
+    role: str
+    content: str
+
+class ChatCompletionRequest(BaseModel):
+    model: str
+    messages: List[Message]
+    temperature: float = Field(default=1.0, ge=0.0, le=2.0)
+    top_p: float = Field(default=1.0, ge=0.0)
+    top_k: int = Field(default=0, ge=0)
+    max_tokens: int = Field(default=32768, gt=0)
+    stream: bool = False
+    reasoning_effort: str = "high"
+
+# --- Endpoints ---
+
+@app.get("/ping")
+async def ping():
+    """Health check endpoint."""
+    logger.info("Received /ping request.")
+    return Response(status_code=status.HTTP_200_OK)
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request, chat_request: ChatCompletionRequest):
+    """Proxies chat completion requests to the OpenWebUI instance."""
+    request_id = request.headers.get("X-Request-ID", "unknown")
+    logger.info(f"[{request_id}] Received chat completion request for model: {chat_request.model}")
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {WEBUI_SECRET_KEY}"
     }
-}
 
-def handler(job):
-    job_input = job['input']
-    log.info(f"Received job: {job['id']}")
-    log.debug(f"Raw job input: {job_input}")
-
-    # Validate the input against the schema
-    validated_input = validate(job_input, INPUT_SCHEMA)
-    if 'errors' in validated_input:
-        log.error(f"Validation errors: {validated_input['errors']}")
-        return {"error": validated_input['errors']}
-    
-    # The validated input is now directly the OpenAI API payload
-    openai_payload = validated_input['validated_input']
-    log.debug(f"OpenAI payload extracted: {openai_payload}")
-
-    # Prepare headers, including the API key if available
-    headers = {"Content-Type": "application/json"}
-    if OPENWEBUI_API_KEY:
-        headers["Authorization"] = f"Bearer {WEBUI_SECRET_KEY}"
-
-    # Forward the request directly to the OpenWebUI API
     try:
-        log.info("Forwarding request to OpenWebUI...")
-        if openai_payload.get('stream', False):
-            # For streaming, we need to return a generator that yields the chunks.
-            # RunPod's serverless worker will handle the streaming back to the client.
-            def stream_generator():
-                with requests.post(
-                    OPENWEBUI_INTERNAL_API_URL,
-                    json=openai_payload,
-                    headers=headers,
-                    stream=True,
-                    timeout=600
-                ) as response:
-                    response.raise_for_status()
-                    log.info("Streaming response from OpenWebUI...")
-                    for chunk in response.iter_content(chunk_size=8192):
-                        log.debug(f"Yielding chunk: {chunk}")
-                        yield chunk
-            return stream_generator()
-        else:
-            # Handle non-streaming response
-            response = requests.post(
-                OPENWEBUI_INTERNAL_API_URL,
-                json=openai_payload,
-                headers=headers,
-                timeout=600
-            )
-            response.raise_for_status()  # Raise an exception for HTTP errors
-            result = response.json()
-            log.info("Received non-streaming response from OpenWebUI.")
-            log.debug(f"OpenWebUI response: {result}")
-            # The key insight from the vLLM worker is that the final output needs to be a dictionary
-            # with a specific structure. For non-streaming, it should be `{"output": result}`.
-            return {"output": result}
+        async with httpx.AsyncClient() as client:
+            # Use the Pydantic model's dict() method to get the payload for the proxy request
+            # This ensures default values are included if not provided in the original request
+            openai_payload = chat_request.dict(exclude_unset=True)
 
-    except requests.exceptions.RequestException as e:
-        log.error(f"Failed to communicate with internal OpenWebUI service: {e}")
-        return {"error": f"Failed to communicate with internal OpenWebUI service: {e}"}
+            if chat_request.stream:
+                # For streaming requests, forward the stream directly
+                req = client.build_request("POST", OPENWEBUI_INTERNAL_API_URL, json=openai_payload, headers=headers, timeout=None)
+                r = await client.send(req, stream=True)
+                r.raise_for_status()
+                logger.info(f"[{request_id}] Streaming response from OpenWebUI.")
+                return StreamingResponse(r.aiter_bytes(), media_type=r.headers.get("Content-Type", "text/event-stream"))
+            else:
+                # For non-streaming requests, get the JSON response
+                response = await client.post(OPENWEBUI_INTERNAL_API_URL, json=openai_payload, headers=headers, timeout=None)
+                response.raise_for_status()
+                logger.info(f"[{request_id}] Non-streaming response from OpenWebUI.")
+                return JSONResponse(content=response.json())
+
+    except ValidationError as e:
+        logger.error(f"[{request_id}] Request validation error: {e.errors()}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": {
+                    "message": "Invalid request payload",
+                    "type": "validation_error",
+                    "code": "invalid_payload",
+                    "errors": e.errors()
+                }
+            }
+        )
+    except httpx.RequestError as e:
+        logger.error(f"[{request_id}] Error proxying request to OpenWebUI: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": {
+                    "message": f"Error communicating with OpenWebUI: {e}",
+                    "type": "proxy_error",
+                    "code": "openwebui_connection_error"
+                }
+            }
+        )
+    except httpx.HTTPStatusError as e:
+        logger.error(f"[{request_id}] OpenWebUI returned an error: {e.response.status_code} - {e.response.text}")
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail={
+                "error": {
+                    "message": f"OpenWebUI returned an error: {e.response.text}",
+                    "type": "openwebui_error",
+                    "code": f"http_status_{e.response.status_code}"
+                }
+            }
+        )
     except Exception as e:
-        log.error(f"An unexpected error occurred in handler: {e}")
-        return {"error": f"An unexpected error occurred in handler: {e}"}
+        logger.error(f"[{request_id}] An unexpected error occurred: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": {
+                    "message": f"An unexpected error occurred: {e}",
+                    "type": "unexpected_error",
+                    "code": "internal_server_error"
+                }
+            }
+        )
 
-runpod.serverless.start({"handler": handler})
+if __name__ == "__main__":
+    # Get ports from environment variables
+    port = int(os.getenv("PORT", 80))
+    logger.info(f"Starting server on port {port}")
+
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port,
+        log_level="info"
+    )
+
