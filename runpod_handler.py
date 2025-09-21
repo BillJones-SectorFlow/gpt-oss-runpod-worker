@@ -69,32 +69,21 @@ async def check_openwebui_health() -> bool:
     """Check if OpenWebUI is responding to health checks."""
     try:
         async with httpx.AsyncClient() as client:
-            # First check if the service is up
-            response = await client.get("http://localhost:8000", timeout=5.0)
-            if response.status_code >= 500:
-                return False
-            
-            # Try a simple completion to ensure model is actually ready
-            test_payload = {
-                "model": "gpt-oss-120b",
-                "messages": [{"role": "user", "content": "test"}],
-                "max_tokens": 1,
-                "stream": False
-            }
-            
-            headers = _build_headers()
-            test_response = await client.post(
-                OPENWEBUI_INTERNAL_API_URL,
-                json=test_payload,
-                headers=headers,
-                timeout=10.0
-            )
-            
-            # If we get a valid response, model is ready
-            return test_response.status_code == 200
-            
+            # Just check if the API endpoint exists and responds
+            response = await client.get("http://localhost:8000/v1/chat/completions", timeout=5.0)
+            # 405 Method Not Allowed is fine - it means the endpoint exists
+            # 200 OK would also be fine
+            # We just want to know the server is up
+            logger.debug(f"Health check response: {response.status_code}")
+            return response.status_code in [200, 405, 422, 400]
+    except httpx.ConnectError:
+        logger.debug(f"Health check failed: Connection refused")
+        return False
+    except httpx.TimeoutException:
+        logger.debug(f"Health check failed: Timeout")
+        return False
     except Exception as e:
-        # During startup, exceptions are expected
+        logger.debug(f"Health check failed: {e}")
         return False
 
 
@@ -153,6 +142,7 @@ async def start_openwebui_process():
         
         # Wait for OpenWebUI to become ready
         elapsed = 0
+        last_check_logged = 0
         while elapsed < MODEL_STARTUP_TIMEOUT:
             # Check if process has died unexpectedly
             if openwebui_process.poll() is not None:
@@ -163,15 +153,27 @@ async def start_openwebui_process():
                     logger.error(f"Final output: {remaining_output}")
                 return False
             
-            if await check_openwebui_health():
-                model_ready = True
-                logger.info("OpenWebUI health check passed! Waiting 2 seconds for full initialization...")
-                await asyncio.sleep(2)  # Give it a moment to fully stabilize
+            # Check if model_ready was set by log_subprocess_output
+            if model_ready:
+                logger.info("Model ready flag detected from OpenWebUI output!")
                 logger.info("OpenWebUI is ready and accepting requests!")
                 return True
             
+            # Also try health check endpoint
+            if elapsed - last_check_logged >= 30:  # Log every 30 seconds
+                if await check_openwebui_health():
+                    model_ready = True
+                    logger.info("OpenWebUI health check passed!")
+                    logger.info("OpenWebUI is ready and accepting requests!")
+                    return True
+                else:
+                    logger.info(f"Health check not ready yet, continuing to monitor output...")
+                last_check_logged = elapsed
+            
             percentage = (elapsed / MODEL_STARTUP_TIMEOUT) * 100
-            logger.info(f"Waiting for OpenWebUI to start... ({elapsed}s elapsed, {percentage:.1f}% of timeout)")
+            if elapsed % 30 == 0:  # Log progress every 30 seconds
+                logger.info(f"Waiting for OpenWebUI to start... ({elapsed}s elapsed, {percentage:.1f}% of timeout)")
+            
             await asyncio.sleep(MODEL_CHECK_INTERVAL)
             elapsed += MODEL_CHECK_INTERVAL
         
