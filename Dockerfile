@@ -15,7 +15,7 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Expose the port for OpenWebUI (which our handler will proxy to)
-EXPOSE 8000
+EXPOSE 8000,80
 
 # Set our custom script as the new entrypoint
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
