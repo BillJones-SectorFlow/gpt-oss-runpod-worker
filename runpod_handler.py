@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import httpx
 import uvicorn
@@ -68,10 +69,54 @@ async def check_openwebui_health() -> bool:
     """Check if OpenWebUI is responding to health checks."""
     try:
         async with httpx.AsyncClient() as client:
+            # First check if the service is up
             response = await client.get("http://localhost:8000", timeout=5.0)
-            return response.status_code < 500
-    except Exception:
+            if response.status_code >= 500:
+                return False
+            
+            # Try a simple completion to ensure model is actually ready
+            test_payload = {
+                "model": "gpt-oss-120b",
+                "messages": [{"role": "user", "content": "test"}],
+                "max_tokens": 1,
+                "stream": False
+            }
+            
+            headers = _build_headers()
+            test_response = await client.post(
+                OPENWEBUI_INTERNAL_API_URL,
+                json=test_payload,
+                headers=headers,
+                timeout=10.0
+            )
+            
+            # If we get a valid response, model is ready
+            return test_response.status_code == 200
+            
+    except Exception as e:
+        # During startup, exceptions are expected
         return False
+
+
+async def log_subprocess_output(process):
+    """Read and log subprocess output in real-time."""
+    try:
+        while process.poll() is None:
+            line = process.stdout.readline()
+            if line:
+                line = line.strip()
+                # Log the output from OpenWebUI
+                logger.info(f"[OpenWebUI] {line}")
+                
+                # Look for percentage indicators in the output
+                # Common patterns: "Loading: 50%", "Progress: 50%", "[50%]", etc.
+                percent_match = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
+                if percent_match:
+                    logger.info(f"[Model Loading Progress] {percent_match.group(0)}")
+            else:
+                await asyncio.sleep(0.1)
+    except Exception as e:
+        logger.error(f"Error reading subprocess output: {e}")
 
 
 async def start_openwebui_process():
@@ -98,23 +143,40 @@ async def start_openwebui_process():
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
-            universal_newlines=True
+            universal_newlines=True,
+            preexec_fn=os.setsid  # Create new process group for better process management
         )
         logger.info(f"OpenWebUI process started with PID: {openwebui_process.pid}")
+        
+        # Start task to log subprocess output
+        output_task = asyncio.create_task(log_subprocess_output(openwebui_process))
         
         # Wait for OpenWebUI to become ready
         elapsed = 0
         while elapsed < MODEL_STARTUP_TIMEOUT:
+            # Check if process has died unexpectedly
+            if openwebui_process.poll() is not None:
+                logger.error(f"OpenWebUI process died unexpectedly with exit code: {openwebui_process.returncode}")
+                # Read any remaining output
+                remaining_output = openwebui_process.stdout.read()
+                if remaining_output:
+                    logger.error(f"Final output: {remaining_output}")
+                return False
+            
             if await check_openwebui_health():
                 model_ready = True
+                logger.info("OpenWebUI health check passed! Waiting 2 seconds for full initialization...")
+                await asyncio.sleep(2)  # Give it a moment to fully stabilize
                 logger.info("OpenWebUI is ready and accepting requests!")
                 return True
             
-            logger.info(f"Waiting for OpenWebUI to start... ({elapsed}s elapsed)")
+            percentage = (elapsed / MODEL_STARTUP_TIMEOUT) * 100
+            logger.info(f"Waiting for OpenWebUI to start... ({elapsed}s elapsed, {percentage:.1f}% of timeout)")
             await asyncio.sleep(MODEL_CHECK_INTERVAL)
             elapsed += MODEL_CHECK_INTERVAL
         
         logger.error(f"OpenWebUI did not start within {MODEL_STARTUP_TIMEOUT} seconds")
+        output_task.cancel()
         return False
         
     except Exception as e:
@@ -129,14 +191,23 @@ def shutdown_openwebui():
     if openwebui_process:
         logger.info(f"Shutting down OpenWebUI process (PID: {openwebui_process.pid})")
         try:
-            openwebui_process.terminate()
+            # Try graceful termination first
+            os.killpg(os.getpgid(openwebui_process.pid), signal.SIGTERM)
             openwebui_process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             logger.warning("OpenWebUI did not terminate gracefully, forcing kill")
-            openwebui_process.kill()
+            try:
+                os.killpg(os.getpgid(openwebui_process.pid), signal.SIGKILL)
+            except:
+                openwebui_process.kill()
             openwebui_process.wait()
         except Exception as e:
             logger.error(f"Error shutting down OpenWebUI: {e}")
+            try:
+                openwebui_process.kill()
+                openwebui_process.wait()
+            except:
+                pass
         finally:
             openwebui_process = None
 
@@ -325,28 +396,48 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
 
         if chat_request.stream:
             async def iter_openwebui_stream():
-                async with httpx.AsyncClient() as client:
-                    async with client.stream(
-                        "POST",
-                        OPENWEBUI_INTERNAL_API_URL,
-                        json=openai_payload,
-                        headers=headers,
-                        timeout=None,
-                    ) as r:
-                        r.raise_for_status()
-                        async for chunk in r.aiter_bytes():
-                            yield chunk
+                try:
+                    async with httpx.AsyncClient() as client:
+                        # Add retry logic for streaming requests
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            try:
+                                async with client.stream(
+                                    "POST",
+                                    OPENWEBUI_INTERNAL_API_URL,
+                                    json=openai_payload,
+                                    headers=headers,
+                                    timeout=httpx.Timeout(60.0, connect=10.0),  # More specific timeout
+                                ) as r:
+                                    r.raise_for_status()
+                                    async for chunk in r.aiter_bytes():
+                                        if chunk:  # Only yield non-empty chunks
+                                            yield chunk
+                                break  # Success, exit retry loop
+                                
+                            except (httpx.ReadError, httpx.RemoteProtocolError) as e:
+                                if attempt < max_retries - 1:
+                                    logger.warning(f"[{request_id}] Streaming error (attempt {attempt + 1}/{max_retries}): {e}")
+                                    await asyncio.sleep(0.5)  # Brief delay before retry
+                                else:
+                                    logger.error(f"[{request_id}] Streaming failed after {max_retries} attempts: {e}")
+                                    raise
+                                    
+                except Exception as e:
+                    logger.error(f"[{request_id}] Streaming error: {e}")
+                    # Send an error message in SSE format
+                    error_msg = f"data: {{\"error\": \"Streaming failed: {str(e)}\"}}\n\n"
+                    yield error_msg.encode()
 
             logger.info(f"[{request_id}] Streaming response from OpenWebUI.")
             return StreamingResponse(iter_openwebui_stream(), media_type="text/event-stream")
 
         else:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
                 response = await client.post(
                     OPENWEBUI_INTERNAL_API_URL,
                     json=openai_payload,
                     headers=headers,
-                    timeout=None,
                 )
                 response.raise_for_status()
                 logger.info(f"[{request_id}] Non-streaming response from OpenWebUI.")
