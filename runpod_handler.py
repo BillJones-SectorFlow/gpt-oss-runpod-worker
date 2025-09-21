@@ -89,6 +89,15 @@ async def check_openwebui_health() -> bool:
 
 async def log_subprocess_output(process):
     """Read and log subprocess output in real-time."""
+    global model_ready
+
+    readiness_markers = (
+        "Start listening on",
+        "Application startup complete",
+        "Uvicorn running on",
+        "INFO:     Started server process",
+    )
+
     try:
         while process.poll() is None:
             line = process.stdout.readline()
@@ -96,12 +105,19 @@ async def log_subprocess_output(process):
                 line = line.strip()
                 # Log the output from OpenWebUI
                 logger.info(f"[OpenWebUI] {line}")
-                
+
                 # Look for percentage indicators in the output
                 # Common patterns: "Loading: 50%", "Progress: 50%", "[50%]", etc.
                 percent_match = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
                 if percent_match:
                     logger.info(f"[Model Loading Progress] {percent_match.group(0)}")
+
+                # Detect when the internal server reports readiness
+                if not model_ready:
+                    lower_line = line.lower()
+                    if any(marker.lower() in lower_line for marker in readiness_markers):
+                        model_ready = True
+                        logger.info("Model marked ready based on OpenWebUI stdout signal.")
             else:
                 await asyncio.sleep(0.1)
     except Exception as e:
@@ -111,7 +127,10 @@ async def log_subprocess_output(process):
 async def start_openwebui_process():
     """Start the OpenWebUI process in the background."""
     global openwebui_process, model_ready
-    
+
+    # Reset readiness flag before launching
+    model_ready = False
+
     # Ensure the model symlink exists
     ensure_model_symlink()
     
@@ -147,6 +166,7 @@ async def start_openwebui_process():
             # Check if process has died unexpectedly
             if openwebui_process.poll() is not None:
                 logger.error(f"OpenWebUI process died unexpectedly with exit code: {openwebui_process.returncode}")
+                model_ready = False
                 # Read any remaining output
                 remaining_output = openwebui_process.stdout.read()
                 if remaining_output:
@@ -188,8 +208,8 @@ async def start_openwebui_process():
 
 def shutdown_openwebui():
     """Gracefully shutdown the OpenWebUI process."""
-    global openwebui_process
-    
+    global openwebui_process, model_ready
+
     if openwebui_process:
         logger.info(f"Shutting down OpenWebUI process (PID: {openwebui_process.pid})")
         try:
@@ -212,6 +232,7 @@ def shutdown_openwebui():
                 pass
         finally:
             openwebui_process = None
+            model_ready = False
 
 
 # ------------------------------------------------------------
