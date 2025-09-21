@@ -2,6 +2,11 @@ import os
 import logging
 import httpx
 import uvicorn
+import asyncio
+import subprocess
+import signal
+import sys
+from pathlib import Path
 from fastapi import FastAPI, Request, Response, status, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, ConfigDict
@@ -28,16 +33,145 @@ OPENWEBUI_INTERNAL_API_URL = os.getenv(
 )
 
 # Retrieve the internal API key set in the entrypoint.sh
-WEBUI_SECRET_KEY = os.getenv("WEBUI_SECRET_KEY")
+WEBUI_SECRET_KEY = os.getenv("WEBUI_SECRET_KEY", "rp-tutel-internal-key")
+
+# Model readiness configuration
+MODEL_STARTUP_TIMEOUT = int(os.getenv("MODEL_STARTUP_TIMEOUT", "600"))  # 10 minutes
+MODEL_CHECK_INTERVAL = int(os.getenv("MODEL_CHECK_INTERVAL", "5"))  # 5 seconds
+
+# ------------------------------------------------------------
+# Global State
+# ------------------------------------------------------------
+model_ready = False
+openwebui_process = None
+startup_task = None
+
+# ------------------------------------------------------------
+# Model Management
+# ------------------------------------------------------------
+
+def ensure_model_symlink():
+    """Ensure the model symlink exists."""
+    openai_dir = Path("./openai")
+    symlink_path = openai_dir / "gpt-oss-120b"
+    target_path = Path("/runpod-volume/models/gpt-oss-120b")
+    
+    if not symlink_path.exists():
+        logger.info(f"Creating symlink: {symlink_path} -> {target_path}")
+        openai_dir.mkdir(parents=True, exist_ok=True)
+        symlink_path.symlink_to(target_path)
+    else:
+        logger.info(f"Symlink already exists: {symlink_path}")
+
+
+async def check_openwebui_health() -> bool:
+    """Check if OpenWebUI is responding to health checks."""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get("http://localhost:8000", timeout=5.0)
+            return response.status_code < 500
+    except Exception:
+        return False
+
+
+async def start_openwebui_process():
+    """Start the OpenWebUI process in the background."""
+    global openwebui_process, model_ready
+    
+    # Ensure the model symlink exists
+    ensure_model_symlink()
+    
+    # Start OpenWebUI process
+    cmd = [
+        "/opt/deepseek-tutel-accel/run.sh",
+        "--serve=webui",
+        "--listen_port", "8000",
+        "--try_path", "./openai/gpt-oss-120b"
+    ]
+    
+    logger.info(f"Starting OpenWebUI with command: {' '.join(cmd)}")
+    
+    try:
+        openwebui_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+        logger.info(f"OpenWebUI process started with PID: {openwebui_process.pid}")
+        
+        # Wait for OpenWebUI to become ready
+        elapsed = 0
+        while elapsed < MODEL_STARTUP_TIMEOUT:
+            if await check_openwebui_health():
+                model_ready = True
+                logger.info("OpenWebUI is ready and accepting requests!")
+                return True
+            
+            logger.info(f"Waiting for OpenWebUI to start... ({elapsed}s elapsed)")
+            await asyncio.sleep(MODEL_CHECK_INTERVAL)
+            elapsed += MODEL_CHECK_INTERVAL
+        
+        logger.error(f"OpenWebUI did not start within {MODEL_STARTUP_TIMEOUT} seconds")
+        return False
+        
+    except Exception as e:
+        logger.error(f"Failed to start OpenWebUI: {e}", exc_info=True)
+        return False
+
+
+def shutdown_openwebui():
+    """Gracefully shutdown the OpenWebUI process."""
+    global openwebui_process
+    
+    if openwebui_process:
+        logger.info(f"Shutting down OpenWebUI process (PID: {openwebui_process.pid})")
+        try:
+            openwebui_process.terminate()
+            openwebui_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            logger.warning("OpenWebUI did not terminate gracefully, forcing kill")
+            openwebui_process.kill()
+            openwebui_process.wait()
+        except Exception as e:
+            logger.error(f"Error shutting down OpenWebUI: {e}")
+        finally:
+            openwebui_process = None
+
 
 # ------------------------------------------------------------
 # FastAPI App
 # ------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Manage the lifecycle of the FastAPI application."""
+    global startup_task
+    
     logger.info("FastAPI application startup.")
+    
+    # Start the OpenWebUI process asynchronously
+    startup_task = asyncio.create_task(start_openwebui_process())
+    
+    # Don't wait for it to complete - let the server start immediately
+    # The task will run in the background
+    
     yield
+    
     logger.info("FastAPI application shutdown.")
+    
+    # Cancel startup task if still running
+    if startup_task and not startup_task.done():
+        startup_task.cancel()
+        try:
+            await startup_task
+        except asyncio.CancelledError:
+            pass
+    
+    # Shutdown OpenWebUI process
+    shutdown_openwebui()
+
 
 app = FastAPI(title="OpenWebUI Proxy Load Balancer", version="1.0.0", lifespan=lifespan)
 
@@ -47,19 +181,17 @@ app = FastAPI(title="OpenWebUI Proxy Load Balancer", version="1.0.0", lifespan=l
 
 class ImageURL(BaseModel):
     url: str
-    # Keep it permissive: some providers accept detail={"low"|"high"|"auto"}
     detail: Optional[str] = None
     model_config = ConfigDict(extra="allow")
 
 
 class InputAudio(BaseModel):
-    data: str            # base64
-    format: Optional[str] = None  # e.g., "wav", "mp3"
+    data: str
+    format: Optional[str] = None
     model_config = ConfigDict(extra="allow")
 
 
 class ContentPart(BaseModel):
-    # Common OpenAI-style parts; keep permissive to avoid schema churn
     type: Literal["text", "image_url", "input_audio"]
     text: Optional[str] = None
     image_url: Optional[Union[str, ImageURL]] = None
@@ -68,11 +200,8 @@ class ContentPart(BaseModel):
 
 
 class Message(BaseModel):
-    # Keep role permissive; don't over-validate (some providers also use "tool")
     role: str
-    # Accept either a simple string or a list of content parts
     content: Union[str, List[ContentPart]]
-    # Allow additional OpenAI fields (name, tool_call_id, tool_calls, etc.)
     model_config = ConfigDict(extra="allow")
 
 
@@ -85,8 +214,6 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int = Field(default=32768, gt=0)
     stream: bool = False
     reasoning_effort: str = "high"
-
-    # Be permissive with evolving OpenAI parameters (tools, response_format, etc.)
     model_config = ConfigDict(extra="allow")
 
 # ------------------------------------------------------------
@@ -95,7 +222,6 @@ class ChatCompletionRequest(BaseModel):
 
 def _build_headers() -> Dict[str, str]:
     headers: Dict[str, str] = {"Content-Type": "application/json"}
-    # Only attach Authorization if key is present; avoid "Bearer None"
     if WEBUI_SECRET_KEY:
         headers["Authorization"] = f"Bearer {WEBUI_SECRET_KEY}"
     return headers
@@ -109,7 +235,6 @@ def _flatten_text_only_content(messages: List[Message]) -> List[Dict[str, Any]]:
     """
     normalized: List[Dict[str, Any]] = []
     for m in messages:
-        # dump everything except content
         base = m.model_dump(exclude={"content"}, exclude_none=True)
         content = m.content
         if isinstance(content, list):
@@ -122,10 +247,8 @@ def _flatten_text_only_content(messages: List[Message]) -> List[Dict[str, Any]]:
                     non_text_found = True
                     break
             if not non_text_found:
-                # Join text parts with newlines (simple, lossless for text-only)
                 base["content"] = "\n".join(text_parts)
             else:
-                # Keep the structured content for backends that support it
                 base["content"] = [p.model_dump(exclude_none=True) for p in content]
         else:
             base["content"] = content
@@ -136,35 +259,71 @@ def _flatten_text_only_content(messages: List[Message]) -> List[Dict[str, Any]]:
 # Endpoints
 # ------------------------------------------------------------
 
+@app.get("/health")
+async def health():
+    """
+    Health check endpoint that indicates both service and model status.
+    Returns 200 if service is up, with model_ready flag in response.
+    """
+    return JSONResponse({
+        "status": "healthy",
+        "model_ready": model_ready,
+        "service": "running"
+    }, status_code=status.HTTP_200_OK)
+
+
 @app.get("/ping")
 async def ping():
-    """Health check endpoint."""
+    """Simple liveness check endpoint."""
     logger.info("Received /ping request.")
-    # Respond with a minimal body so some health checkers don't treat an empty
-    # body as a failure.
     return JSONResponse({"ok": True}, status_code=status.HTTP_200_OK)
+
+
+@app.get("/ready")
+async def ready():
+    """
+    Readiness check endpoint.
+    Returns 200 if model is ready, 503 if still loading.
+    """
+    if model_ready:
+        return JSONResponse({"ready": True}, status_code=status.HTTP_200_OK)
+    else:
+        return JSONResponse(
+            {"ready": False, "message": "Model is still loading"},
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE
+        )
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, chat_request: ChatCompletionRequest):
     """
     Proxies chat completion requests to the OpenWebUI instance.
-    Accepts both string and content-part list for message.content.
+    Returns 503 if model is not ready yet.
     """
     request_id = request.headers.get("X-Request-ID", "unknown")
     logger.info(f"[{request_id}] Received chat completion request for model: {chat_request.model}")
+    
+    # Check if model is ready
+    if not model_ready:
+        logger.warning(f"[{request_id}] Model not ready yet, returning 503")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": {
+                    "message": "Model is still loading. Please try again in a few moments.",
+                    "type": "model_not_ready",
+                    "code": "model_loading",
+                }
+            }
+        )
 
     headers = _build_headers()
 
     try:
-        # Build a dict from the validated request. We keep it lean (exclude None).
         openai_payload: Dict[str, Any] = chat_request.model_dump(exclude_none=True)
-
-        # Normalize messages so text-only content lists are flattened into strings
         openai_payload["messages"] = _flatten_text_only_content(chat_request.messages)
 
         if chat_request.stream:
-            # --- Streaming path: keep the HTTPX stream open while yielding bytes ---
             async def iter_openwebui_stream():
                 async with httpx.AsyncClient() as client:
                     async with client.stream(
@@ -179,11 +338,9 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
                             yield chunk
 
             logger.info(f"[{request_id}] Streaming response from OpenWebUI.")
-            # Upstreams typically use SSE
             return StreamingResponse(iter_openwebui_stream(), media_type="text/event-stream")
 
         else:
-            # --- Non-streaming path ---
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     OPENWEBUI_INTERNAL_API_URL,
@@ -195,8 +352,6 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
                 logger.info(f"[{request_id}] Non-streaming response from OpenWebUI.")
                 return JSONResponse(content=response.json())
 
-    # NOTE: Pydantic validation for the body happens *before* entering this function.
-    # This except block is mainly for any additional internal validation you add later.
     except ValidationError as e:
         logger.error(f"[{request_id}] Request validation error: {e.errors()}")
         raise HTTPException(
@@ -250,6 +405,22 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
                 }
             },
         )
+
+
+# ------------------------------------------------------------
+# Signal Handlers
+# ------------------------------------------------------------
+
+def signal_handler(sig, frame):
+    """Handle shutdown signals gracefully."""
+    logger.info(f"Received signal {sig}, shutting down...")
+    shutdown_openwebui()
+    sys.exit(0)
+
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
 
 # ------------------------------------------------------------
 # Entrypoint
