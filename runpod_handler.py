@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, ConfigDict
 from typing import List, Dict, Any, Optional, Union, Literal
 from contextlib import asynccontextmanager
+
 # ------------------------------------------------------------
 # Logging
 # ------------------------------------------------------------
@@ -22,6 +23,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
+
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
@@ -30,49 +32,72 @@ logger = logging.getLogger(__name__)
 OPENWEBUI_INTERNAL_API_URL = os.getenv(
     "OPENWEBUI_INTERNAL_API_URL", "http://localhost:8000/v1/chat/completions"
 )
+
 # Retrieve the internal API key set in the entrypoint.sh
 WEBUI_SECRET_KEY = os.getenv("WEBUI_SECRET_KEY", "rp-tutel-internal-key")
+
 # Model readiness configuration
-MODEL_STARTUP_TIMEOUT = int(os.getenv("MODEL_STARTUP_TIMEOUT", "600")) # 10 minutes
-MODEL_CHECK_INTERVAL = int(os.getenv("MODEL_CHECK_INTERVAL", "5")) # 5 seconds
+MODEL_STARTUP_TIMEOUT = int(os.getenv("MODEL_STARTUP_TIMEOUT", "600"))  # 10 minutes
+MODEL_CHECK_INTERVAL = int(os.getenv("MODEL_CHECK_INTERVAL", "5"))  # 5 seconds
+
 # ------------------------------------------------------------
 # Global State
 # ------------------------------------------------------------
 model_ready = False
 openwebui_process = None
 startup_task = None
+
 # ------------------------------------------------------------
 # Model Management
 # ------------------------------------------------------------
+
 def ensure_model_symlink():
     """Ensure the model symlink exists."""
     openai_dir = Path("./openai")
     symlink_path = openai_dir / "gpt-oss-120b"
     target_path = Path("/runpod-volume/models/gpt-oss-120b")
-   
+    
     if not symlink_path.exists():
         logger.info(f"Creating symlink: {symlink_path} -> {target_path}")
         openai_dir.mkdir(parents=True, exist_ok=True)
         symlink_path.symlink_to(target_path)
     else:
         logger.info(f"Symlink already exists: {symlink_path}")
+
+
 async def check_openwebui_health() -> bool:
     """Check if OpenWebUI is responding to health checks."""
     try:
         async with httpx.AsyncClient() as client:
-            # Check the /health endpoint for readiness
-            response = await client.get("http://localhost:8000/", timeout=5.0)
-            logger.info(f"Health check response: {response.status_code}")
-            return response.status_code == 200
-    except httpx.ConnectError:
-        logger.info(f"Health check failed: Connection refused")
-        return False
-    except httpx.TimeoutException:
-        logger.info(f"Health check failed: Timeout")
-        return False
+            # First check if the service is up
+            response = await client.get("http://localhost:8000", timeout=5.0)
+            if response.status_code >= 500:
+                return False
+            
+            # Try a simple completion to ensure model is actually ready
+            test_payload = {
+                "model": "openai/gpt-oss-120b",
+                "messages": [{"role": "user", "content": "test"}],
+                "max_tokens": 1,
+                "stream": False
+            }
+            
+            headers = _build_headers()
+            test_response = await client.post(
+                OPENWEBUI_INTERNAL_API_URL,
+                json=test_payload,
+                headers=headers,
+                timeout=10.0
+            )
+            
+            # If we get a valid response, model is ready
+            return test_response.status_code == 200
+            
     except Exception as e:
-        logger.info(f"Health check failed: {e}")
+        # During startup, exceptions are expected
         return False
+
+
 async def log_subprocess_output(process):
     """Read and log subprocess output in real-time."""
     try:
@@ -82,7 +107,7 @@ async def log_subprocess_output(process):
                 line = line.strip()
                 # Log the output from OpenWebUI
                 logger.info(f"[OpenWebUI] {line}")
-               
+                
                 # Look for percentage indicators in the output
                 # Common patterns: "Loading: 50%", "Progress: 50%", "[50%]", etc.
                 percent_match = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
@@ -92,13 +117,15 @@ async def log_subprocess_output(process):
                 await asyncio.sleep(0.1)
     except Exception as e:
         logger.error(f"Error reading subprocess output: {e}")
+
+
 async def start_openwebui_process():
     """Start the OpenWebUI process in the background."""
     global openwebui_process, model_ready
-   
+    
     # Ensure the model symlink exists
     ensure_model_symlink()
-   
+    
     # Start OpenWebUI process
     cmd = [
         "/opt/deepseek-tutel-accel/run.sh",
@@ -106,9 +133,9 @@ async def start_openwebui_process():
         "--listen_port", "8000",
         "--try_path", "./openai/gpt-oss-120b"
     ]
-   
+    
     logger.info(f"Starting OpenWebUI with command: {' '.join(cmd)}")
-   
+    
     try:
         openwebui_process = subprocess.Popen(
             cmd,
@@ -117,13 +144,13 @@ async def start_openwebui_process():
             text=True,
             bufsize=1,
             universal_newlines=True,
-            preexec_fn=os.setsid # Create new process group for better process management
+            preexec_fn=os.setsid  # Create new process group for better process management
         )
         logger.info(f"OpenWebUI process started with PID: {openwebui_process.pid}")
-       
+        
         # Start task to log subprocess output
         output_task = asyncio.create_task(log_subprocess_output(openwebui_process))
-       
+        
         # Wait for OpenWebUI to become ready
         elapsed = 0
         while elapsed < MODEL_STARTUP_TIMEOUT:
@@ -135,32 +162,32 @@ async def start_openwebui_process():
                 if remaining_output:
                     logger.error(f"Final output: {remaining_output}")
                 return False
-           
-            # Try health check endpoint
+            
             if await check_openwebui_health():
                 model_ready = True
-                logger.info("OpenWebUI health check passed!")
+                logger.info("OpenWebUI health check passed! Waiting 2 seconds for full initialization...")
+                await asyncio.sleep(2)  # Give it a moment to fully stabilize
                 logger.info("OpenWebUI is ready and accepting requests!")
                 return True
             
             percentage = (elapsed / MODEL_STARTUP_TIMEOUT) * 100
-            if elapsed % 30 == 0: # Log progress every 30 seconds
-                logger.info(f"Waiting for OpenWebUI to start... ({elapsed}s elapsed, {percentage:.1f}% of timeout)")
-           
+            logger.info(f"Waiting for OpenWebUI to start... ({elapsed}s elapsed, {percentage:.1f}% of timeout)")
             await asyncio.sleep(MODEL_CHECK_INTERVAL)
             elapsed += MODEL_CHECK_INTERVAL
-       
+        
         logger.error(f"OpenWebUI did not start within {MODEL_STARTUP_TIMEOUT} seconds")
         output_task.cancel()
         return False
-       
+        
     except Exception as e:
         logger.error(f"Failed to start OpenWebUI: {e}", exc_info=True)
         return False
+
+
 def shutdown_openwebui():
     """Gracefully shutdown the OpenWebUI process."""
     global openwebui_process
-   
+    
     if openwebui_process:
         logger.info(f"Shutting down OpenWebUI process (PID: {openwebui_process.pid})")
         try:
@@ -183,6 +210,8 @@ def shutdown_openwebui():
                 pass
         finally:
             openwebui_process = None
+
+
 # ------------------------------------------------------------
 # FastAPI App
 # ------------------------------------------------------------
@@ -190,19 +219,19 @@ def shutdown_openwebui():
 async def lifespan(app: FastAPI):
     """Manage the lifecycle of the FastAPI application."""
     global startup_task
-   
+    
     logger.info("FastAPI application startup.")
-   
+    
     # Start the OpenWebUI process asynchronously
     startup_task = asyncio.create_task(start_openwebui_process())
-   
+    
     # Don't wait for it to complete - let the server start immediately
     # The task will run in the background
-   
+    
     yield
-   
+    
     logger.info("FastAPI application shutdown.")
-   
+    
     # Cancel startup task if still running
     if startup_task and not startup_task.done():
         startup_task.cancel()
@@ -210,31 +239,43 @@ async def lifespan(app: FastAPI):
             await startup_task
         except asyncio.CancelledError:
             pass
-   
+    
     # Shutdown OpenWebUI process
     shutdown_openwebui()
+
+
 app = FastAPI(title="OpenWebUI Proxy Load Balancer", version="1.0.0", lifespan=lifespan)
+
 # ------------------------------------------------------------
 # Pydantic Models (OpenAI-compatible and permissive)
 # ------------------------------------------------------------
+
 class ImageURL(BaseModel):
     url: str
     detail: Optional[str] = None
     model_config = ConfigDict(extra="allow")
+
+
 class InputAudio(BaseModel):
     data: str
     format: Optional[str] = None
     model_config = ConfigDict(extra="allow")
+
+
 class ContentPart(BaseModel):
     type: Literal["text", "image_url", "input_audio"]
     text: Optional[str] = None
     image_url: Optional[Union[str, ImageURL]] = None
     input_audio: Optional[InputAudio] = None
     model_config = ConfigDict(extra="allow")
+
+
 class Message(BaseModel):
     role: str
     content: Union[str, List[ContentPart]]
     model_config = ConfigDict(extra="allow")
+
+
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[Message]
@@ -245,14 +286,18 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     reasoning_effort: str = "high"
     model_config = ConfigDict(extra="allow")
+
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
+
 def _build_headers() -> Dict[str, str]:
     headers: Dict[str, str] = {"Content-Type": "application/json"}
     if WEBUI_SECRET_KEY:
         headers["Authorization"] = f"Bearer {WEBUI_SECRET_KEY}"
     return headers
+
+
 def _flatten_text_only_content(messages: List[Message]) -> List[Dict[str, Any]]:
     """
     Some OpenAI-compatible backends still expect message.content to be a string.
@@ -280,50 +325,43 @@ def _flatten_text_only_content(messages: List[Message]) -> List[Dict[str, Any]]:
             base["content"] = content
         normalized.append(base)
     return normalized
+
 # ------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------
-@app.get("/health")
-async def health():
-    """
-    Health check endpoint that indicates both service and model status.
-    Returns 200 if service is up, with model_ready flag in response.
-    """
-    return JSONResponse({
-        "status": "healthy",
-        "model_ready": model_ready,
-        "service": "running"
-    }, status_code=status.HTTP_200_OK)
+
 @app.get("/ping")
 async def ping():
-    """Simple liveness check endpoint."""
-    logger.info("Received /ping request.")
-    return JSONResponse({"ok": True}, status_code=status.HTTP_200_OK)
-@app.get("/ready")
-async def ready():
     """
     Readiness check endpoint.
-    Returns 200 if model is ready, 503 if still loading.
+    Returns 200 if model is ready, 204 if still loading.
     """
+    logger.info("Received /ping request.")
     if model_ready:
-        return JSONResponse({"ready": True}, status_code=status.HTTP_200_OK)
+        return JSONResponse({"status": "healthy"}, status_code=status.HTTP_200_OK)
     else:
-        return JSONResponse(
-            {"ready": False, "message": "Model is still loading"},
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE
-        )
+        return JSONResponse({"status": "initializing"}, status_code=status.HTTP_204_NO_CONTENT)
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, chat_request: ChatCompletionRequest):
     """
     Proxies chat completion requests to the OpenWebUI instance.
-    Returns 503 if model is not ready yet.
+    Returns 503 if model is not ready yet after waiting.
     """
     request_id = request.headers.get("X-Request-ID", "unknown")
     logger.info(f"[{request_id}] Received chat completion request for model: {chat_request.model}")
    
-    # Check if model is ready
+    # Check if model is ready, wait up to 5 minutes
+    wait_timeout = 300  # 5 minutes
+    check_interval = 5  # seconds
+    elapsed = 0
+    while not model_ready and elapsed < wait_timeout:
+        logger.info(f"[{request_id}] Model not ready, waiting... ({elapsed}s elapsed)")
+        await asyncio.sleep(check_interval)
+        elapsed += check_interval
+   
     if not model_ready:
-        logger.warning(f"[{request_id}] Model not ready yet, returning 503")
+        logger.warning(f"[{request_id}] Model not ready after {wait_timeout}s, returning 503")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
@@ -335,9 +373,11 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
             }
         )
     headers = _build_headers()
+
     try:
         openai_payload: Dict[str, Any] = chat_request.model_dump(exclude_none=True)
         openai_payload["messages"] = _flatten_text_only_content(chat_request.messages)
+
         if chat_request.stream:
             async def iter_openwebui_stream():
                 try:
@@ -351,29 +391,31 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
                                     OPENWEBUI_INTERNAL_API_URL,
                                     json=openai_payload,
                                     headers=headers,
-                                    timeout=httpx.Timeout(60.0, connect=10.0), # More specific timeout
+                                    timeout=httpx.Timeout(60.0, connect=10.0),  # More specific timeout
                                 ) as r:
                                     r.raise_for_status()
                                     async for chunk in r.aiter_bytes():
-                                        if chunk: # Only yield non-empty chunks
+                                        if chunk:  # Only yield non-empty chunks
                                             yield chunk
-                                break # Success, exit retry loop
-                               
+                                break  # Success, exit retry loop
+                                
                             except (httpx.ReadError, httpx.RemoteProtocolError) as e:
                                 if attempt < max_retries - 1:
                                     logger.warning(f"[{request_id}] Streaming error (attempt {attempt + 1}/{max_retries}): {e}")
-                                    await asyncio.sleep(0.5) # Brief delay before retry
+                                    await asyncio.sleep(0.5)  # Brief delay before retry
                                 else:
                                     logger.error(f"[{request_id}] Streaming failed after {max_retries} attempts: {e}")
                                     raise
-                                   
+                                    
                 except Exception as e:
                     logger.error(f"[{request_id}] Streaming error: {e}")
                     # Send an error message in SSE format
                     error_msg = f"data: {{\"error\": \"Streaming failed: {str(e)}\"}}\n\n"
                     yield error_msg.encode()
+
             logger.info(f"[{request_id}] Streaming response from OpenWebUI.")
             return StreamingResponse(iter_openwebui_stream(), media_type="text/event-stream")
+
         else:
             async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
                 response = await client.post(
@@ -384,6 +426,7 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
                 response.raise_for_status()
                 logger.info(f"[{request_id}] Non-streaming response from OpenWebUI.")
                 return JSONResponse(content=response.json())
+
     except ValidationError as e:
         logger.error(f"[{request_id}] Request validation error: {e.errors()}")
         raise HTTPException(
@@ -397,6 +440,7 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
                 }
             },
         )
+
     except httpx.RequestError as e:
         logger.error(f"[{request_id}] Error proxying request to OpenWebUI: {e}")
         raise HTTPException(
@@ -409,6 +453,7 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
                 }
             },
         )
+
     except httpx.HTTPStatusError as e:
         body_text = e.response.text
         logger.error(f"[{request_id}] OpenWebUI returned an error: {e.response.status_code} - {body_text}")
@@ -422,6 +467,7 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
                 }
             },
         )
+
     except Exception as e:
         logger.error(f"[{request_id}] An unexpected error occurred: {e}", exc_info=True)
         raise HTTPException(
@@ -434,26 +480,33 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
                 }
             },
         )
+
+
 # ------------------------------------------------------------
 # Signal Handlers
 # ------------------------------------------------------------
+
 def signal_handler(sig, frame):
     """Handle shutdown signals gracefully."""
     logger.info(f"Received signal {sig}, shutting down...")
     shutdown_openwebui()
     sys.exit(0)
+
+
 # Register signal handlers
 signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
+
 # ------------------------------------------------------------
 # Entrypoint
 # ------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 80))
     logger.info(f"Starting server on port {port}")
+
     uvicorn.run(
         app,
         host="0.0.0.0",
         port=port,
-        log_level="debug",
+        log_level="info",
     )
