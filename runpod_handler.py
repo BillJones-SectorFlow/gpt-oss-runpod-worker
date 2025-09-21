@@ -60,21 +60,18 @@ async def check_openwebui_health() -> bool:
     """Check if OpenWebUI is responding to health checks."""
     try:
         async with httpx.AsyncClient() as client:
-            # Just check if the API endpoint exists and responds
-            response = await client.get("http://localhost:8000/v1/chat/completions", timeout=5.0)
-            # 405 Method Not Allowed is fine - it means the endpoint exists
-            # 200 OK would also be fine
-            # We just want to know the server is up
-            logger.debug(f"Health check response: {response.status_code}")
-            return response.status_code in [200, 405, 422, 400]
+            # Check the /health endpoint for readiness
+            response = await client.get("http://localhost:8000/", timeout=5.0)
+            logger.info(f"Health check response: {response.status_code}")
+            return response.status_code == 200
     except httpx.ConnectError:
-        logger.debug(f"Health check failed: Connection refused")
+        logger.info(f"Health check failed: Connection refused")
         return False
     except httpx.TimeoutException:
-        logger.debug(f"Health check failed: Timeout")
+        logger.info(f"Health check failed: Timeout")
         return False
     except Exception as e:
-        logger.debug(f"Health check failed: {e}")
+        logger.info(f"Health check failed: {e}")
         return False
 async def log_subprocess_output(process):
     """Read and log subprocess output in real-time."""
