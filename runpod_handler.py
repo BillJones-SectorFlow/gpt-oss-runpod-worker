@@ -297,35 +297,6 @@ def _build_headers() -> Dict[str, str]:
         headers["Authorization"] = f"Bearer {WEBUI_SECRET_KEY}"
     return headers
 
-
-def _flatten_text_only_content(messages: List[Message]) -> List[Dict[str, Any]]:
-    """
-    Some OpenAI-compatible backends still expect message.content to be a string.
-    If a message has a list of *only* text parts, merge them into a string.
-    Otherwise, keep the content as-is.
-    """
-    normalized: List[Dict[str, Any]] = []
-    for m in messages:
-        base = m.model_dump(exclude={"content"}, exclude_none=True)
-        content = m.content
-        if isinstance(content, list):
-            text_parts: List[str] = []
-            non_text_found = False
-            for part in content:
-                if part.type == "text" and part.text is not None:
-                    text_parts.append(part.text)
-                else:
-                    non_text_found = True
-                    break
-            if not non_text_found:
-                base["content"] = "\n".join(text_parts)
-            else:
-                base["content"] = [p.model_dump(exclude_none=True) for p in content]
-        else:
-            base["content"] = content
-        normalized.append(base)
-    return normalized
-
 # ------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------
@@ -376,7 +347,6 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
 
     try:
         openai_payload: Dict[str, Any] = chat_request.model_dump(exclude_none=True)
-        openai_payload["messages"] = _flatten_text_only_content(chat_request.messages)
 
         if chat_request.stream:
             async def iter_openwebui_stream():
