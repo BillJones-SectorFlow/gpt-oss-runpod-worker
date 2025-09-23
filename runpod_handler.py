@@ -101,21 +101,17 @@ async def check_openwebui_health() -> bool:
 async def log_subprocess_output(process):
     """Read and log subprocess output in real-time using async I/O."""
     try:
+        loop = asyncio.get_event_loop()
         while True:
             # Check if process has terminated
             if process.poll() is not None:
                 break
                 
-            # Use asyncio sleep to prevent blocking
-            await asyncio.sleep(0.1)
-            
             # Try to read output non-blocking
             try:
-                # Read available output
+                # Run readline in executor without creating a task first
                 line = await asyncio.wait_for(
-                    asyncio.create_task(asyncio.get_event_loop().run_in_executor(
-                        None, process.stdout.readline
-                    )), 
+                    loop.run_in_executor(None, process.stdout.readline),
                     timeout=0.1
                 )
                 
@@ -129,6 +125,7 @@ async def log_subprocess_output(process):
                     if percent_match:
                         logger.info(f"[Model Loading Progress] {percent_match.group(0)}")
             except asyncio.TimeoutError:
+                # No output available right now, continue
                 continue
                 
     except Exception as e:
