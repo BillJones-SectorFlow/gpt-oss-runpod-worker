@@ -99,22 +99,38 @@ async def check_openwebui_health() -> bool:
 
 
 async def log_subprocess_output(process):
-    """Read and log subprocess output in real-time."""
+    """Read and log subprocess output in real-time using async I/O."""
     try:
-        while process.poll() is None:
-            line = process.stdout.readline()
-            if line:
-                line = line.strip()
-                # Log the output from OpenWebUI
-                logger.info(f"[OpenWebUI] {line}")
+        while True:
+            # Check if process has terminated
+            if process.poll() is not None:
+                break
                 
-                # Look for percentage indicators in the output
-                # Common patterns: "Loading: 50%", "Progress: 50%", "[50%]", etc.
-                percent_match = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
-                if percent_match:
-                    logger.info(f"[Model Loading Progress] {percent_match.group(0)}")
-            else:
-                await asyncio.sleep(0.1)
+            # Use asyncio sleep to prevent blocking
+            await asyncio.sleep(0.1)
+            
+            # Try to read output non-blocking
+            try:
+                # Read available output
+                line = await asyncio.wait_for(
+                    asyncio.create_task(asyncio.get_event_loop().run_in_executor(
+                        None, process.stdout.readline
+                    )), 
+                    timeout=0.1
+                )
+                
+                if line:
+                    line = line.strip()
+                    # Log the output from OpenWebUI
+                    logger.info(f"[OpenWebUI] {line}")
+                    
+                    # Look for percentage indicators in the output
+                    percent_match = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
+                    if percent_match:
+                        logger.info(f"[Model Loading Progress] {percent_match.group(0)}")
+            except asyncio.TimeoutError:
+                continue
+                
     except Exception as e:
         logger.error(f"Error reading subprocess output: {e}")
 
