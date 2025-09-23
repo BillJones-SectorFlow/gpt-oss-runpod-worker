@@ -324,7 +324,8 @@ async def ping():
     if model_ready:
         return JSONResponse({"status": "healthy"}, status_code=status.HTTP_200_OK)
     else:
-        return JSONResponse({"status": "initializing"}, status_code=status.HTTP_204_NO_CONTENT)
+        # 204 No Content should not have a body
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, chat_request: ChatCompletionRequest):
