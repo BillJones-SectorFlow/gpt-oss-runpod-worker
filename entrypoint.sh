@@ -8,8 +8,8 @@ export WEBUI_SECRET_KEY="rp-tutel-internal-key"
 # export MODEL_CHECK_INTERVAL=5     # Check every 5 seconds
 # export LOG_LEVEL=INFO
 
-mkdir -p /app/openai
-mount -t nfs -o nconnect=16 nfs.fin-03.datacrunch.io:/gpt-oss-b141abc0/ /app/openai
+rm -rf /app/openai
+ln -s /runpod-volume /app/openai
 
 # Execute the command passed to the entrypoint (our RunPod handler)
 # This starts our FastAPI server which will handle starting OpenWebUI
