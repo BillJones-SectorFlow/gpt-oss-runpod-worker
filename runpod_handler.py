@@ -113,12 +113,37 @@ async def log_subprocess_output(process):
     except Exception as e:
         logger.error(f"Error reading subprocess output: {e}")
 
-
 async def start_openwebui_process():
     """Start Tutel core server (no WebUI) without killing our own FastAPI."""
     global openwebui_process, model_ready
-
+    ensure_model_symlink()
     logger.info(f"Current dir before mount: {os.getcwd()}")
+    
+    # Additional logging
+    try:
+        logger.info(f"Contents of current dir: {os.listdir('.')}")
+    except Exception as e:
+        logger.info(f"Could not list current dir: {e}")
+    
+    logger.info(f"Looking for model at: {os.path.abspath('./openai/gpt-oss-120b')}")
+    logger.info(f"Model path exists: {os.path.exists('./openai/gpt-oss-120b')}")
+    
+    if os.path.exists('./openai'):
+        try:
+            logger.info(f"Contents of ./openai: {os.listdir('./openai')}")
+        except Exception as e:
+            logger.info(f"Could not list ./openai: {e}")
+    else:
+        logger.info("./openai does not exist")
+    
+    if os.path.exists('./openai/gpt-oss-120b'):
+        try:
+            logger.info(f"Contents of ./openai/gpt-oss-120b: {os.listdir('./openai/gpt-oss-120b')}")
+        except Exception as e:
+            logger.info(f"Could not list ./openai/gpt-oss-120b: {e}")
+    else:
+        logger.info("./openai/gpt-oss-120b does not exist")
+    
     python_bin = sys.executable
     cmd = [
         python_bin, "-u", "/opt/deepseek-tutel-accel/llm_moe_tutel.py",
@@ -170,7 +195,6 @@ async def start_openwebui_process():
     except Exception as e:
         logger.error(f"Failed to start Tutel: {e}", exc_info=True)
         return False
-
 
 def shutdown_openwebui():
     """Gracefully shutdown the OpenWebUI process."""
