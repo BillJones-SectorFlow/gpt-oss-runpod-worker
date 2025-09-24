@@ -135,10 +135,6 @@ async def log_subprocess_output(process):
 async def start_openwebui_process():
     """Start the OpenWebUI process in the background."""
     global openwebui_process, model_ready
-
-    # Mount the shared filesystem
-    mkdir -p /runpod-volume/models
-    sudo mount -t nfs -o nconnect=16 nfs.fin-03.datacrunch.io:/gpt-oss-b141abc0 /runpod-volume/
     
     # Ensure the model symlink exists
     ensure_model_symlink()
