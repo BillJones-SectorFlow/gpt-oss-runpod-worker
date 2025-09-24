@@ -47,25 +47,6 @@ model_ready = False
 openwebui_process = None
 startup_task = None
 
-# ------------------------------------------------------------
-# Model Management
-# ------------------------------------------------------------
-
-def ensure_model_symlink():
-    """Ensure the model symlink exists."""
-    
-    openai_dir = Path("./openai")
-    symlink_path = openai_dir / "gpt-oss-120b"
-    target_path = Path("/runpod-volume/openai/gpt-oss-120b")
-    
-    if not symlink_path.exists():
-        logger.info(f"Creating symlink: {symlink_path} -> {target_path}")
-        openai_dir.mkdir(parents=True, exist_ok=True)
-        symlink_path.symlink_to(target_path)
-    else:
-        logger.info(f"Symlink already exists: {symlink_path}")
-
-
 async def check_openwebui_health() -> bool:
     """Check if OpenWebUI is responding to health checks."""
     try:
@@ -136,7 +117,7 @@ async def log_subprocess_output(process):
 async def start_openwebui_process():
     """Start Tutel core server (no WebUI) without killing our own FastAPI."""
     global openwebui_process, model_ready
-    ensure_model_symlink()
+
     logger.info(f"Current dir before mount: {os.getcwd()}")
     python_bin = sys.executable
     cmd = [
