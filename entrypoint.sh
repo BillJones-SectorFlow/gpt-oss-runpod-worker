@@ -9,7 +9,7 @@ export WEBUI_SECRET_KEY="rp-tutel-internal-key"
 # export LOG_LEVEL=INFO
 
 mkdir -p /app/openai
-sudo mount -t nfs -o nconnect=16 nfs.fin-03.datacrunch.io:/gpt-oss-b141abc0/ /app/openai || echo "Could not mount NFS share"
+mount -t nfs -o nconnect=16 nfs.fin-03.datacrunch.io:/gpt-oss-b141abc0/ /app/openai || echo "Could not mount NFS share"
 
 # Execute the command passed to the entrypoint (our RunPod handler)
 # This starts our FastAPI server which will handle starting OpenWebUI
