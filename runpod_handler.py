@@ -136,11 +136,8 @@ async def log_subprocess_output(process):
 async def start_openwebui_process():
     """Start Tutel core server (no WebUI) without killing our own FastAPI."""
     global openwebui_process, model_ready
-
     ensure_model_symlink()
-
-    logger.info("Current dir before mount: $(pwd)")
-
+    logger.info(f"Current dir before mount: {os.getcwd()}")
     python_bin = sys.executable
     cmd = [
         python_bin, "-u", "/opt/deepseek-tutel-accel/llm_moe_tutel.py",
@@ -149,7 +146,6 @@ async def start_openwebui_process():
         "--try_path", "./openai/gpt-oss-120b",
     ]
     logger.info(f"Starting Tutel core with command: {' '.join(cmd)}")
-
     try:
         env = os.environ.copy()
         env["LD_LIBRARY_PATH"] = env.get("LD_LIBRARY_PATH", "") + ":/usr/lib/x86_64-linux-gnu"
@@ -157,7 +153,6 @@ async def start_openwebui_process():
         env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
         env.setdefault("HF_HUB_OFFLINE", "1")
         env.setdefault("LOCAL_SIZE", os.getenv("LOCAL_SIZE", "1"))
-
         openwebui_process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -169,9 +164,7 @@ async def start_openwebui_process():
             env=env,
         )
         logger.info(f"Tutel process started with PID: {openwebui_process.pid}")
-
         output_task = asyncio.create_task(log_subprocess_output(openwebui_process))
-
         elapsed = 0
         while elapsed < MODEL_STARTUP_TIMEOUT:
             if openwebui_process.poll() is not None:
@@ -180,23 +173,19 @@ async def start_openwebui_process():
                 if remaining_output:
                     logger.error(f"Final output: {remaining_output}")
                 return False
-
             if await check_openwebui_health():
                 model_ready = True
                 logger.info("Health check passed; waiting 2s to stabilize…")
                 await asyncio.sleep(2)
                 logger.info("Tutel is ready.")
                 return True
-
             percentage = (elapsed / MODEL_STARTUP_TIMEOUT) * 100
             logger.info(f"Waiting for Tutel… ({elapsed}s elapsed, {percentage:.1f}% of timeout)")
             await asyncio.sleep(MODEL_CHECK_INTERVAL)
             elapsed += MODEL_CHECK_INTERVAL
-
         logger.error(f"Tutel did not start within {MODEL_STARTUP_TIMEOUT} seconds")
         output_task.cancel()
         return False
-
     except Exception as e:
         logger.error(f"Failed to start Tutel: {e}", exc_info=True)
         return False
