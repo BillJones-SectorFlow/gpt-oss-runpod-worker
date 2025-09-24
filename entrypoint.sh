@@ -8,6 +8,7 @@ export WEBUI_SECRET_KEY="rp-tutel-internal-key"
 # export MODEL_CHECK_INTERVAL=5     # Check every 5 seconds
 # export LOG_LEVEL=INFO
 
+umount /app/openai 2>/dev/null || true
 rm -rf /app/openai
 ln -s /runpod-volume /app/openai
 
