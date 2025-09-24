@@ -14,6 +14,9 @@ COPY runpod_handler.py /app/runpod_handler.py
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
+RUN rm -rf /opt/deepseek-tutel-accel/llm_moe_tutel.py
+COPY llm_moe_tutel.py /opt/deepseek-tutel-accel/llm_moe_tutel.py
+
 # Expose the port for OpenWebUI (which our handler will proxy to)
 EXPOSE 8000 80
 
