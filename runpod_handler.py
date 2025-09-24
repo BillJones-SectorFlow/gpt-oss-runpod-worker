@@ -116,7 +116,6 @@ async def log_subprocess_output(process):
 async def start_openwebui_process():
     """Start Tutel core server (no WebUI) without killing our own FastAPI."""
     global openwebui_process, model_ready
-    ensure_model_symlink()
     logger.info(f"Current dir before mount: {os.getcwd()}")
     
     # Additional logging
