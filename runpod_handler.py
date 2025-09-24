@@ -53,6 +53,10 @@ startup_task = None
 
 def ensure_model_symlink():
     """Ensure the model symlink exists."""
+
+    mkdir -p /runpod-volume
+    sudo mount -t nfs -o nconnect=16 nfs.fin-03.datacrunch.io:/gpt-oss-b141abc0 /runpod-volume || logger.warn("NFS shared filesystem could not be mounted.")
+    
     openai_dir = Path("./openai")
     symlink_path = openai_dir / "gpt-oss-120b"
     target_path = Path("/runpod-volume/openai/gpt-oss-120b")
@@ -138,6 +142,8 @@ async def start_openwebui_process():
     
     # Ensure the model symlink exists
     ensure_model_symlink()
+
+    logger.info("Current dir before mount: $(pwd)")
     
     # Start OpenWebUI process
     cmd = [
