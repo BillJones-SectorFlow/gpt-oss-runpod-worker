@@ -137,25 +137,30 @@ async def log_subprocess_output(process):
 
 
 async def start_openwebui_process():
-    """Start the OpenWebUI process in the background."""
+    """Start Tutel core server (no WebUI) without killing our own FastAPI."""
     global openwebui_process, model_ready
-    
-    # Ensure the model symlink exists
+
     ensure_model_symlink()
 
     logger.info("Current dir before mount: $(pwd)")
-    
-    # Start OpenWebUI process
+
+    python_bin = sys.executable
     cmd = [
-        "/opt/deepseek-tutel-accel/run.sh",
+        python_bin, "-u", "/opt/deepseek-tutel-accel/llm_moe_tutel.py",
         "--serve=core",
         "--listen_port", "8000",
-        "--try_path", "./openai/gpt-oss-120b"
+        "--try_path", "./openai/gpt-oss-120b",
     ]
-    
-    logger.info(f"Starting OpenWebUI with command: {' '.join(cmd)}")
-    
+    logger.info(f"Starting Tutel core with command: {' '.join(cmd)}")
+
     try:
+        env = os.environ.copy()
+        env["LD_LIBRARY_PATH"] = env.get("LD_LIBRARY_PATH", "") + ":/usr/lib/x86_64-linux-gnu"
+        env.setdefault("NCCL_DEBUG", "INFO")
+        env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+        env.setdefault("HF_HUB_OFFLINE", "1")
+        env.setdefault("LOCAL_SIZE", os.getenv("LOCAL_SIZE", "1"))
+
         openwebui_process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -163,43 +168,40 @@ async def start_openwebui_process():
             text=True,
             bufsize=1,
             universal_newlines=True,
-            preexec_fn=os.setsid  # Create new process group for better process management
+            preexec_fn=os.setsid,
+            env=env,
         )
-        logger.info(f"OpenWebUI process started with PID: {openwebui_process.pid}")
-        
-        # Start task to log subprocess output
+        logger.info(f"Tutel process started with PID: {openwebui_process.pid}")
+
         output_task = asyncio.create_task(log_subprocess_output(openwebui_process))
-        
-        # Wait for OpenWebUI to become ready
+
         elapsed = 0
         while elapsed < MODEL_STARTUP_TIMEOUT:
-            # Check if process has died unexpectedly
             if openwebui_process.poll() is not None:
-                logger.error(f"OpenWebUI process died unexpectedly with exit code: {openwebui_process.returncode}")
-                # Read any remaining output
+                logger.error(f"Tutel process died with exit code: {openwebui_process.returncode}")
                 remaining_output = openwebui_process.stdout.read()
                 if remaining_output:
                     logger.error(f"Final output: {remaining_output}")
                 return False
-            
+
             if await check_openwebui_health():
                 model_ready = True
-                logger.info("OpenWebUI health check passed! Waiting 2 seconds for full initialization...")
-                await asyncio.sleep(2)  # Give it a moment to fully stabilize
-                logger.info("OpenWebUI is ready and accepting requests!")
+                logger.info("Health check passed; waiting 2s to stabilize…")
+                await asyncio.sleep(2)
+                logger.info("Tutel is ready.")
                 return True
-            
+
             percentage = (elapsed / MODEL_STARTUP_TIMEOUT) * 100
-            logger.info(f"Waiting for OpenWebUI to start... ({elapsed}s elapsed, {percentage:.1f}% of timeout)")
+            logger.info(f"Waiting for Tutel… ({elapsed}s elapsed, {percentage:.1f}% of timeout)")
             await asyncio.sleep(MODEL_CHECK_INTERVAL)
             elapsed += MODEL_CHECK_INTERVAL
-        
-        logger.error(f"OpenWebUI did not start within {MODEL_STARTUP_TIMEOUT} seconds")
+
+        logger.error(f"Tutel did not start within {MODEL_STARTUP_TIMEOUT} seconds")
         output_task.cancel()
         return False
-        
+
     except Exception as e:
-        logger.error(f"Failed to start OpenWebUI: {e}", exc_info=True)
+        logger.error(f"Failed to start Tutel: {e}", exc_info=True)
         return False
 
 
