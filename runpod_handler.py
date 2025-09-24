@@ -123,7 +123,7 @@ async def start_openwebui_process():
         "--serve=core",
         "--listen_port", "8000",
         "--try_path", "./openai/gpt-oss-120b",
-        "--try_path", "./runpod-volume/gpt-oss-120b",
+        "--try_path", "/runpod-volume/gpt-oss-120b",
     ]
     logger.info(f"Starting Tutel core with command: {' '.join(cmd)}")
     try:
