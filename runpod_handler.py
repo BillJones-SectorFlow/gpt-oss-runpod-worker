@@ -142,7 +142,7 @@ async def start_openwebui_process():
     # Start OpenWebUI process
     cmd = [
         "/opt/deepseek-tutel-accel/run.sh",
-        "--serve",
+        "--serve=core",
         "--listen_port", "8000",
         "--try_path", "./openai/gpt-oss-120b"
     ]
