@@ -129,7 +129,7 @@ async def start_openwebui_process():
         env["LD_LIBRARY_PATH"] = env.get("LD_LIBRARY_PATH", "") + ":/usr/lib/x86_64-linux-gnu"
         env.setdefault("NCCL_DEBUG", "INFO")
         env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
-        env.setdefault("HF_HUB_OFFLINE", "1")
+        env.setdefault("HF_HUB_OFFLINE", "0")
         env.setdefault("LOCAL_SIZE", os.getenv("LOCAL_SIZE", "1"))
         openwebui_process = subprocess.Popen(
             cmd,
