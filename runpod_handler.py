@@ -75,7 +75,7 @@ async def check_openwebui_health() -> bool:
             # If we get a valid response, model is ready
             return test_response.status_code == 200
             
-    except Exception as e:
+    except Exception:
         # During startup, exceptions are expected
         return False
 
@@ -369,6 +369,69 @@ def _build_headers() -> Dict[str, str]:
         headers["Authorization"] = f"Bearer {WEBUI_SECRET_KEY}"
     return headers
 
+
+def _flatten_content_parts_to_text(content: Union[str, List[Any]]) -> str:
+    """
+    Convert OpenAI-style content (string or list of parts) to a plain text string.
+    - If already a string, return as-is.
+    - If a list, join 'text' parts; for non-text parts, include a lightweight placeholder.
+    """
+    if isinstance(content, str):
+        return content
+
+    parts_out: List[str] = []
+    for part in content:
+        # part may be a dict (from model_dump) or a ContentPart
+        p_type = None
+        text = None
+        image_url = None
+
+        if isinstance(part, dict):
+            p_type = part.get("type")
+            text = part.get("text")
+            image_url = part.get("image_url")
+        else:
+            # Pydantic model instance
+            p_type = getattr(part, "type", None)
+            text = getattr(part, "text", None)
+            image_url = getattr(part, "image_url", None)
+
+        if p_type == "text" and text:
+            parts_out.append(text)
+        elif p_type == "image_url" and image_url:
+            # image_url can be str or {"url": "..."}
+            url_str = None
+            if isinstance(image_url, str):
+                url_str = image_url
+            elif isinstance(image_url, dict):
+                url_str = image_url.get("url")
+            else:
+                url_str = getattr(image_url, "url", None)
+            if url_str:
+                parts_out.append(f"[image: {url_str}]")
+        elif p_type == "input_audio":
+            parts_out.append("[audio]")
+        # silently ignore unknown types
+
+    return "\n".join([p for p in parts_out if p]).strip()
+
+
+def _normalize_for_openwebui(chat_request: ChatCompletionRequest) -> Dict[str, Any]:
+    """
+    Build the payload for OpenWebUI/Tutel, flattening list-style 'content' into strings.
+    """
+    payload: Dict[str, Any] = chat_request.model_dump(exclude_none=True)
+
+    normalized_messages: List[Dict[str, Any]] = []
+    for m in payload.get("messages", []):
+        role = m.get("role")
+        content = m.get("content")
+        flattened = _flatten_content_parts_to_text(content)
+        normalized_messages.append({"role": role, "content": flattened})
+
+    payload["messages"] = normalized_messages
+    return payload
+
 # ------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------
@@ -419,7 +482,8 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
     headers = _build_headers()
 
     try:
-        openai_payload: Dict[str, Any] = chat_request.model_dump(exclude_none=True)
+        # NORMALIZE: flatten list content into plain text for OpenWebUI/Tutel
+        openai_payload: Dict[str, Any] = _normalize_for_openwebui(chat_request)
 
         if chat_request.stream:
             async def iter_openwebui_stream():
