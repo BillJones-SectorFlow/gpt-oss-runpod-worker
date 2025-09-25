@@ -13,6 +13,10 @@ import shutil
 import threading
 from datetime import datetime
 
+# Force unbuffered output for better subprocess communication
+sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
+sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
+
 # Set tutel timeout BEFORE any tutel imports to ensure it takes effect
 os.environ['TUTEL_GLOBAL_TIMEOUT_SEC'] = str(2147483647)
 os.environ['D3D12_ENABLE_FP16'] = '1'
@@ -47,9 +51,17 @@ torch.backends.cuda.matmul.allow_tf32 = True
 def _ts():
   return datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] + 'Z'
 
-def _log(line: str, prefix: str = ""):
+def _log(line: str, prefix: str = "", progress_pct: float = None):
+  """Log with optional progress percentage for parent process detection."""
   msg = f"{_ts()} - {prefix}{line}" if prefix else f"{_ts()} - {line}"
-  print(msg, file=sys.stderr, flush=True)  # Added flush=True for immediate output
+  
+  # If progress percentage is provided, include it in a parseable format
+  if progress_pct is not None:
+    msg = f"{msg} ({progress_pct:.1f}%)"
+  
+  print(msg, file=sys.stderr, flush=True)
+  # Also print to stdout for redundancy
+  print(msg, file=sys.stdout, flush=True)
 
 def _has_safetensors(dir_path: str) -> bool:
   try:
@@ -82,71 +94,104 @@ def _run_and_stream(cmd, env=None, prefix='[HF-CLI] '):
   _log(f"Exec: {' '.join(cmd)}", prefix=prefix)
   start = time.time()
   
-  # Use PIPE for both stdout and stderr, but combine them
+  # Create process with proper pipe configuration
   proc = subprocess.Popen(
       cmd,
       stdout=subprocess.PIPE,
       stderr=subprocess.STDOUT,
-      bufsize=0,  # Changed from 1 to 0 for unbuffered output
-      text=True,
-      universal_newlines=True,
+      bufsize=0,  # Unbuffered for immediate output
+      text=False,  # Use bytes mode for more control
       env=env
   )
 
   last_output = [time.time()]
-  output_complete = threading.Event()
+  output_lines = []
+  partial_line = b""
   
   def _reader():
+    nonlocal partial_line
     try:
       while True:
-        line = proc.stdout.readline()
-        if not line:
-          break
+        # Read one byte at a time for immediate visibility
+        chunk = proc.stdout.read(1024)
+        if not chunk:
+          if proc.poll() is not None:
+            break
+          continue
+        
         last_output[0] = time.time()
-        # Normalize progress-bar carriage returns into readable updates
-        line = line.rstrip('\n')
-        if '\r' in line:
-          # keep only the last carriage-return segment to avoid spam
-          segments = line.split('\r')
-          line = segments[-1]
-        if line.strip():
-          _log(line, prefix=prefix)
+        
+        # Handle the chunk
+        lines = (partial_line + chunk).split(b'\n')
+        partial_line = lines[-1]
+        
+        for line in lines[:-1]:
+          try:
+            decoded = line.decode('utf-8', errors='replace').rstrip()
+            if decoded:
+              # Clean up carriage returns for progress bars
+              if '\r' in decoded:
+                decoded = decoded.split('\r')[-1]
+              
+              # Calculate download progress if possible
+              elapsed = time.time() - start
+              if "Downloading" in decoded or "%" in decoded:
+                # Try to extract percentage from HF CLI output
+                import re
+                pct_match = re.search(r'(\d+)%', decoded)
+                if pct_match:
+                  pct = float(pct_match.group(1))
+                  _log(decoded, prefix=prefix, progress_pct=pct)
+                else:
+                  _log(decoded, prefix=prefix)
+              else:
+                _log(decoded, prefix=prefix)
+              
+              output_lines.append(decoded)
+          except Exception as e:
+            _log(f"[ERROR] Failed to decode line: {e}", prefix=prefix)
+      
+      # Handle any remaining partial line
+      if partial_line:
+        try:
+          decoded = partial_line.decode('utf-8', errors='replace').rstrip()
+          if decoded:
+            _log(decoded, prefix=prefix)
+            output_lines.append(decoded)
+        except:
+          pass
+            
     except Exception as e:
       _log(f"[ERROR] Reader thread exception: {e}", prefix=prefix)
     finally:
-      output_complete.set()
       try:
         proc.stdout.close()
       except:
         pass
 
-  # Use non-daemon thread to ensure it completes
-  t = threading.Thread(target=_reader, daemon=False)
-  t.start()
+  # Start reader thread
+  reader_thread = threading.Thread(target=_reader)
+  reader_thread.daemon = False  # Ensure thread completes
+  reader_thread.start()
 
-  # heartbeat while running
-  while True:
-    rc = proc.poll()
+  # Monitor process with heartbeats
+  while proc.poll() is None:
     now = time.time()
     if now - last_output[0] > 10:  # quiet for 10s -> heartbeat
       elapsed = int(now - start)
-      _log(f"(still running, {elapsed}s elapsed)", prefix=prefix)
+      pct = min((elapsed / 300.0) * 100, 99)  # Estimate based on typical download time
+      _log(f"(still downloading, {elapsed}s elapsed)", prefix=prefix, progress_pct=pct)
       last_output[0] = now
-    if rc is not None:
-      break
     time.sleep(2)
 
-  # Wait for reader thread to complete (with a reasonable timeout)
-  # Increased timeout to ensure we capture all output
-  if not output_complete.wait(timeout=30):
-    _log(f"[WARN] Output reader thread did not complete within 30s", prefix=prefix)
-  
-  t.join(timeout=5)  # Final join to clean up thread
+  # Wait for reader to finish
+  reader_thread.join(timeout=10)
   
   if proc.returncode != 0:
     raise RuntimeError(f"Command failed (exit={proc.returncode}): {' '.join(cmd)}")
+  
   elapsed = int(time.time() - start)
-  _log(f"Completed in {elapsed}s", prefix=prefix)
+  _log(f"Completed in {elapsed}s", prefix=prefix, progress_pct=100)
 
 def _ensure_latest_hf_cli(raise_on_error: bool):
   """Upgrade to latest huggingface_hub[cli] with logs."""
@@ -180,12 +225,13 @@ def _download_with_hf_cli(repo_id: str, local_dir: str):
   # Ensure online mode and visible progress
   dl_env['HF_HUB_OFFLINE'] = '0'
   dl_env.pop('HF_HUB_DISABLE_PROGRESS_BARS', None)
-  # Ensure Python output is unbuffered for subprocess
+  # Ensure Python and subprocess output is unbuffered
   dl_env['PYTHONUNBUFFERED'] = '1'
+  dl_env['COLUMNS'] = '120'  # Set terminal width for better progress bars
 
   # The CLI will create a small .cache dir under local_dir; that's intended.
   cmd = [cli, "download", repo_id, "--repo-type", "model", "--local-dir", local_dir]
-  _log(f"Starting model download: repo='{repo_id}', dest='{local_dir}'", prefix='[HF-Download] ')
+  _log(f"Starting model download: repo='{repo_id}', dest='{local_dir}'", prefix='[HF-Download] ', progress_pct=0)
 
   # Disk space info (useful for visibility)
   try:
@@ -251,6 +297,7 @@ def _ensure_local_model(path_to_model: str, hf_model: str) -> str:
     os.makedirs(target_dir, exist_ok=True)
 
     # Step 3: download to local dir (no global cache pollution).
+    _log("Starting model download process", prefix='[Model] ', progress_pct=0)
     _download_with_hf_cli(hf_model, target_dir)
 
     # Step 4: verify presence of safetensors in the target root.
@@ -260,6 +307,7 @@ def _ensure_local_model(path_to_model: str, hf_model: str) -> str:
         f"Ensure the repo '{hf_model}' contains safetensors at its top level."
       )
     _summarize_safetensors(target_dir)
+    _log("Model download complete!", prefix='[Model] ', progress_pct=100)
 
   # If in distributed mode, wait for rank 0 to complete
   if world_size > 1 and world_rank != 0:
@@ -282,10 +330,12 @@ def _ensure_local_model(path_to_model: str, hf_model: str) -> str:
   return target_dir
 
 # Resolve (and if needed, fetch) the model BEFORE tutel initialization
+_log("Initializing model loading...", prefix='[STARTUP] ')
 model_id = _ensure_local_model(args.path_to_model, args.hf_model)
 _log(f"[INFO] Discover the model from local path: {model_id}, chosen as the default model.")
 
 # NOW initialize tutel after model is ready
+_log("Initializing Tutel distributed framework...", prefix='[STARTUP] ')
 try:
   from tutel import system, net
 
@@ -343,10 +393,11 @@ except:
 
 def master_print(*args, **kwargs):
   if world_rank == 0:
-     print(*args, **kwargs, file=sys.stderr)
+     print(*args, **kwargs, file=sys.stderr, flush=True)
 
 # -----------------------------------------------------------------
 
+_log("Loading tokenizer and config...", prefix='[STARTUP] ')
 tokenizer = AutoTokenizer.from_pretrained(f'{model_id}', trust_remote_code=True)
 config = json.loads(pathlib.Path(f'{model_id}/config.json').read_text())
 
@@ -399,6 +450,7 @@ def load_to(filename, params):
 param = {}
 state_dict = {}
 
+_log("Loading model weights from safetensors...", prefix='[STARTUP] ')
 for f in os.listdir(model_id):
   if f.endswith('.safetensors'):
     load_to(f'{model_id}/{f}', state_dict)
@@ -698,6 +750,7 @@ def load_experts():
 
   return gate_up_p, down_p
 
+_log("Loading expert weights...", prefix='[STARTUP] ')
 gate_up_p, down_p = load_experts()
 
 del state_dict
@@ -713,6 +766,7 @@ token_emb = token_emb.view(token_emb.size(0), -1)
 master_print('Synchronizing with other peers..')
 peer_barrier()
 
+_log("Initializing Tutel operations...", prefix='[STARTUP] ')
 try:
   sigp = torch.ops.tutel_ops.uncached_empty([8192 * 16], torch.int32)
   sigp = torch.ops.tutel_ops.uncached_exchange(sigp[0], net.simple_all_gather(sigp[1]), world_rank)
@@ -732,6 +786,7 @@ elif model_type in ('gpt_oss'):
 else:
   raise Exception(f'Unrecognized model type: {model_type}')
 
+_log(f"Loading model module: {module}", prefix='[STARTUP] ')
 exec(compile(open(module).read(), filename=module, mode='exec'))
 
 
@@ -989,6 +1044,7 @@ FastAPI.router_fn = router_fn
 def serve():
   if world_rank == 0:
     addr = '0.0.0.0'
+    _log(f"Model ready! Starting API server...", prefix='[STARTUP] ', progress_pct=100)
     master_print(f'''
 Start listening on {addr}:{args.listen_port}. Request examples:
 
@@ -1020,6 +1076,7 @@ if __name__ == '__main__':
   if user_prompt:
     generate(token_encode(user_prompt).to(device))
     master_print()
+  _log("Running benchmarks...", prefix='[STARTUP] ')
   benchmark()
   if args.serve is None and not user_prompt:
      args.serve = "core"
