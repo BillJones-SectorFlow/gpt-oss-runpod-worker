@@ -8,13 +8,18 @@ import pathlib, json, time
 import argparse
 import numpy as np
 from torch.utils.cpp_extension import IS_HIP_EXTENSION
+import subprocess
+import shutil
 
 os.environ['TUTEL_GLOBAL_TIMEOUT_SEC'] = str(2147483647)
 os.environ['D3D12_ENABLE_FP16'] = '1'
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--hf_model', type=str, default='openai/gpt-oss-120b')
-parser.add_argument('--path_to_model', type=str, default='/data/models/gpt-oss-120b')
+# Removed: --try_path
+parser.add_argument('--hf_model', type=str, default='openai/gpt-oss-120b',
+                    help='Hugging Face repo id to download if local model is missing (e.g. openai/gpt-oss-120b)')
+parser.add_argument('--path_to_model', type=str, default='/data/models/gpt-oss-120b',
+                    help='Local directory where model files (.safetensors, config.json, tokenizer, etc.) should live')
 parser.add_argument('--max_seq_len', type=int, default=1024 * 8)
 parser.add_argument('--buffer_size', type=int, default=32)
 parser.add_argument('--listen_port', type=int, default=8000)
@@ -93,28 +98,109 @@ def master_print(*args, **kwargs):
   if world_rank == 0:
      print(*args, **kwargs, file=sys.stderr)
 
-# Check and download model if necessary
-import subprocess
-import shutil
+# ---------- New: local model bootstrap & HF CLI handling ----------
 
-if world_rank == 0:
-    if os.path.exists(args.path_to_model):
-        # Check for safetensors files
-        has_safetensors = any(f.endswith('.safetensors') for f in os.listdir(args.path_to_model))
-        if not has_safetensors:
-            # Clear the directory
-            shutil.rmtree(args.path_to_model)
-            os.makedirs(args.path_to_model)
-            # Download the model
-            subprocess.run(['hf', 'download', args.hf_model, '--local-dir', args.path_to_model], check=True)
-    else:
-        # Create directory and download
-        os.makedirs(args.path_to_model)
-        subprocess.run(['hf', 'download', args.hf_model, '--local-dir', args.path_to_model], check=True)
+def _has_safetensors(dir_path: str) -> bool:
+  try:
+    return os.path.isdir(dir_path) and any(f.endswith('.safetensors') for f in os.listdir(dir_path))
+  except FileNotFoundError:
+    return False
 
-# Set model_id to the path
-model_id = args.path_to_model
-master_print(f"[INFO] Using model from local path: {model_id}")
+def _safe_remove_dir_contents(dir_path: str):
+  """Remove everything under dir_path safely (leave the directory itself)."""
+  abs_path = os.path.abspath(dir_path)
+  if abs_path in ('/', ''):
+    raise RuntimeError(f"Refusing to remove contents of unsafe path: '{abs_path}'")
+  if not os.path.isdir(abs_path):
+    return
+  for entry in os.listdir(abs_path):
+    full = os.path.join(abs_path, entry)
+    try:
+      if os.path.isfile(full) or os.path.islink(full):
+        os.unlink(full)
+      else:
+        shutil.rmtree(full)
+    except Exception as e:
+      master_print(f"[WARN] Failed to remove '{full}': {e}")
+
+def _ensure_latest_hf_cli(raise_on_error: bool):
+  """Upgrade to latest huggingface_hub[cli]."""
+  try:
+    cmd = [sys.executable, "-m", "pip", "install", "-U", "huggingface_hub[cli]"]
+    master_print(f"[INFO] Ensuring latest huggingface_hub[cli]: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
+  except Exception as e:
+    master_print(f"[WARN] Unable to upgrade huggingface_hub[cli]: {e}")
+    if raise_on_error:
+      raise
+
+def _find_hf_cli() -> str:
+  """Return the CLI executable name ('hf' preferred), or '' if not found."""
+  for candidate in ("hf", "huggingface-cli"):
+    if shutil.which(candidate):
+      return candidate
+  return ""
+
+def _download_with_hf_cli(repo_id: str, local_dir: str):
+  """Download entire repo into local_dir (no nested repo folder) using CLI."""
+  cli = _find_hf_cli()
+  if not cli:
+    # Final attempt: install then re-check
+    _ensure_latest_hf_cli(raise_on_error=True)
+    cli = _find_hf_cli()
+    if not cli:
+      raise RuntimeError("Hugging Face CLI not found even after installing huggingface_hub[cli].")
+
+  # Use explicit repo-type for clarity; default is 'model' for model repos.
+  cmd = [cli, "download", repo_id, "--repo-type", "model", "--local-dir", local_dir]
+  master_print(f"[INFO] Downloading model with CLI: {' '.join(cmd)}")
+  # Blocking download; will raise on non-zero exit.
+  subprocess.run(cmd, check=True)
+
+def _ensure_local_model(path_to_model: str, hf_model: str) -> str:
+  """Ensure model shards live directly in path_to_model; download if needed."""
+  target_dir = os.path.abspath(path_to_model)
+
+  # Step 0: ensure latest CLI (requested) – only rank 0 actually runs pip.
+  if world_rank == 0:
+    _ensure_latest_hf_cli(raise_on_error=False)
+  peer_barrier()
+
+  # Step 1: if usable local model exists, short-circuit.
+  if _has_safetensors(target_dir):
+    master_print(f"[INFO] Found existing model shards in '{target_dir}'. Using local files.")
+    return target_dir
+
+  # Step 2: prepare directory (create or wipe).
+  if world_rank == 0:
+    if os.path.isdir(target_dir):
+      master_print(f"[INFO] No .safetensors found in '{target_dir}'. Cleaning it before download.")
+      _safe_remove_dir_contents(target_dir)
+    os.makedirs(target_dir, exist_ok=True)
+
+    # Step 3: download to local dir (no global cache pollution).
+    _download_with_hf_cli(hf_model, target_dir)
+
+    # Step 4: verify presence of safetensors in the target root.
+    if not _has_safetensors(target_dir):
+      raise RuntimeError(
+        f"Download finished but no '.safetensors' files were found directly under '{target_dir}'. "
+        f"Ensure the repo '{hf_model}' contains safetensors at its top level."
+      )
+
+  # Step 5: sync all ranks and re-verify.
+  peer_barrier()
+  if not _has_safetensors(target_dir):
+    raise RuntimeError(
+      f"Model files are still not visible in '{target_dir}' after download. "
+      f"Please check filesystem permissions and shared storage visibility."
+    )
+  return target_dir
+
+# Resolve (and if needed, fetch) the model locally, then proceed.
+model_id = _ensure_local_model(args.path_to_model, args.hf_model)
+master_print(f"[INFO] Discover the model from local path: {model_id}, chosen as the default model.")
+# -----------------------------------------------------------------
 
 tokenizer = AutoTokenizer.from_pretrained(f'{model_id}', trust_remote_code=True)
 config = json.loads(pathlib.Path(f'{model_id}/config.json').read_text())
