@@ -10,7 +10,10 @@ import numpy as np
 from torch.utils.cpp_extension import IS_HIP_EXTENSION
 import subprocess
 import shutil
+import threading
+from datetime import datetime
 
+# Set tutel timeout BEFORE any tutel imports to ensure it takes effect
 os.environ['TUTEL_GLOBAL_TIMEOUT_SEC'] = str(2147483647)
 os.environ['D3D12_ENABLE_FP16'] = '1'
 
@@ -39,6 +42,250 @@ except Exception as ex:
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
+# ---------- New: local model bootstrap & HF CLI handling with verbose logging ----------
+
+def _ts():
+  return datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] + 'Z'
+
+def _log(line: str, prefix: str = ""):
+  msg = f"{_ts()} - {prefix}{line}" if prefix else f"{_ts()} - {line}"
+  print(msg, file=sys.stderr, flush=True)  # Added flush=True for immediate output
+
+def _has_safetensors(dir_path: str) -> bool:
+  try:
+    return os.path.isdir(dir_path) and any(f.endswith('.safetensors') for f in os.listdir(dir_path))
+  except FileNotFoundError:
+    return False
+
+def _safe_remove_dir_contents(dir_path: str):
+  """Remove everything under dir_path safely (leave the directory itself)."""
+  abs_path = os.path.abspath(dir_path)
+  if abs_path in ('/', ''):
+    raise RuntimeError(f"Refusing to remove contents of unsafe path: '{abs_path}'")
+  if not os.path.isdir(abs_path):
+    return
+  for entry in os.listdir(abs_path):
+    full = os.path.join(abs_path, entry)
+    try:
+      if os.path.isfile(full) or os.path.islink(full):
+        os.unlink(full)
+      else:
+        shutil.rmtree(full)
+    except Exception as e:
+      _log(f"[WARN] Failed to remove '{full}': {e}")
+
+def _run_and_stream(cmd, env=None, prefix='[HF-CLI] '):
+  """
+  Run a subprocess, stream stdout+stderr lines to logs with timestamps,
+  and print periodic heartbeats if the process is quiet.
+  """
+  _log(f"Exec: {' '.join(cmd)}", prefix=prefix)
+  start = time.time()
+  
+  # Use PIPE for both stdout and stderr, but combine them
+  proc = subprocess.Popen(
+      cmd,
+      stdout=subprocess.PIPE,
+      stderr=subprocess.STDOUT,
+      bufsize=0,  # Changed from 1 to 0 for unbuffered output
+      text=True,
+      universal_newlines=True,
+      env=env
+  )
+
+  last_output = [time.time()]
+  output_complete = threading.Event()
+  
+  def _reader():
+    try:
+      while True:
+        line = proc.stdout.readline()
+        if not line:
+          break
+        last_output[0] = time.time()
+        # Normalize progress-bar carriage returns into readable updates
+        line = line.rstrip('\n')
+        if '\r' in line:
+          # keep only the last carriage-return segment to avoid spam
+          segments = line.split('\r')
+          line = segments[-1]
+        if line.strip():
+          _log(line, prefix=prefix)
+    except Exception as e:
+      _log(f"[ERROR] Reader thread exception: {e}", prefix=prefix)
+    finally:
+      output_complete.set()
+      try:
+        proc.stdout.close()
+      except:
+        pass
+
+  # Use non-daemon thread to ensure it completes
+  t = threading.Thread(target=_reader, daemon=False)
+  t.start()
+
+  # heartbeat while running
+  while True:
+    rc = proc.poll()
+    now = time.time()
+    if now - last_output[0] > 10:  # quiet for 10s -> heartbeat
+      elapsed = int(now - start)
+      _log(f"(still running, {elapsed}s elapsed)", prefix=prefix)
+      last_output[0] = now
+    if rc is not None:
+      break
+    time.sleep(2)
+
+  # Wait for reader thread to complete (with a reasonable timeout)
+  # Increased timeout to ensure we capture all output
+  if not output_complete.wait(timeout=30):
+    _log(f"[WARN] Output reader thread did not complete within 30s", prefix=prefix)
+  
+  t.join(timeout=5)  # Final join to clean up thread
+  
+  if proc.returncode != 0:
+    raise RuntimeError(f"Command failed (exit={proc.returncode}): {' '.join(cmd)}")
+  elapsed = int(time.time() - start)
+  _log(f"Completed in {elapsed}s", prefix=prefix)
+
+def _ensure_latest_hf_cli(raise_on_error: bool):
+  """Upgrade to latest huggingface_hub[cli] with logs."""
+  try:
+    cmd = [sys.executable, "-m", "pip", "install", "-U", "huggingface_hub[cli]"]
+    _run_and_stream(cmd, prefix='[HF-PIP] ')
+  except Exception as e:
+    _log(f"Unable to upgrade huggingface_hub[cli]: {e}", prefix='[HF-PIP] ')
+    if raise_on_error:
+      raise
+
+def _find_hf_cli() -> str:
+  """Return the CLI executable name ('hf' preferred), or '' if not found."""
+  for candidate in ("hf", "huggingface-cli"):
+    if shutil.which(candidate):
+      return candidate
+  return ""
+
+def _download_with_hf_cli(repo_id: str, local_dir: str):
+  """Download entire repo into local_dir (no nested repo folder) using CLI with live logs."""
+  cli = _find_hf_cli()
+  if not cli:
+    # Final attempt: install then re-check
+    _ensure_latest_hf_cli(raise_on_error=True)
+    cli = _find_hf_cli()
+    if not cli:
+      raise RuntimeError("Hugging Face CLI not found even after installing huggingface_hub[cli].")
+
+  # Make progress bars visible & readable in logs
+  dl_env = os.environ.copy()
+  # Ensure online mode and visible progress
+  dl_env['HF_HUB_OFFLINE'] = '0'
+  dl_env.pop('HF_HUB_DISABLE_PROGRESS_BARS', None)
+  # Ensure Python output is unbuffered for subprocess
+  dl_env['PYTHONUNBUFFERED'] = '1'
+
+  # The CLI will create a small .cache dir under local_dir; that's intended.
+  cmd = [cli, "download", repo_id, "--repo-type", "model", "--local-dir", local_dir]
+  _log(f"Starting model download: repo='{repo_id}', dest='{local_dir}'", prefix='[HF-Download] ')
+
+  # Disk space info (useful for visibility)
+  try:
+    total, used, free = shutil.disk_usage(os.path.abspath(local_dir))
+    _log(f"Disk before download - total={total//(1024**3)}GiB, used={used//(1024**3)}GiB, free={free//(1024**3)}GiB",
+         prefix='[HF-Download] ')
+  except Exception:
+    pass
+
+  _run_and_stream(cmd, env=dl_env, prefix='[HF-Download] ')
+
+  # Disk space post
+  try:
+    total, used, free = shutil.disk_usage(os.path.abspath(local_dir))
+    _log(f"Disk after download  - total={total//(1024**3)}GiB, used={used//(1024**3)}GiB, free={free//(1024**3)}GiB",
+         prefix='[HF-Download] ')
+  except Exception:
+    pass
+
+def _summarize_safetensors(dir_path: str):
+  total_bytes = 0
+  count = 0
+  try:
+    for f in os.listdir(dir_path):
+      if f.endswith('.safetensors'):
+        count += 1
+        try:
+          total_bytes += os.path.getsize(os.path.join(dir_path, f))
+        except Exception:
+          pass
+  except Exception:
+    pass
+  if count:
+    mb = total_bytes / (1024 * 1024)
+    _log(f"Found {count} .safetensors files ({mb:.1f} MiB) in '{dir_path}'", prefix='[HF-Verify] ')
+
+def _ensure_local_model(path_to_model: str, hf_model: str) -> str:
+  """Ensure model shards live directly in path_to_model; download if needed; log progress clearly."""
+  target_dir = os.path.abspath(path_to_model)
+
+  # Step 1: if usable local model exists, short-circuit (check before any distributed init).
+  if _has_safetensors(target_dir):
+    _log(f"Using existing model shards in '{target_dir}'.", prefix='[Model] ')
+    _summarize_safetensors(target_dir)
+    return target_dir
+
+  # Only proceed with download if we're not in a distributed environment yet
+  # or if we're rank 0
+  world_rank = int(os.environ.get('RANK', 0))
+  world_size = int(os.environ.get('WORLD_SIZE', 1))
+  
+  if world_rank == 0:
+    # Step 0: ensure latest CLI
+    _log(f"Ensuring latest huggingface_hub[cli]...", prefix='[HF-PIP] ')
+    _ensure_latest_hf_cli(raise_on_error=False)
+    
+    # Step 2: prepare directory (create or wipe).
+    if os.path.isdir(target_dir):
+      _log(f"No .safetensors found in '{target_dir}'. Cleaning it before download.", prefix='[Model] ')
+      _safe_remove_dir_contents(target_dir)
+    else:
+      _log(f"Creating model directory '{target_dir}'", prefix='[Model] ')
+    os.makedirs(target_dir, exist_ok=True)
+
+    # Step 3: download to local dir (no global cache pollution).
+    _download_with_hf_cli(hf_model, target_dir)
+
+    # Step 4: verify presence of safetensors in the target root.
+    if not _has_safetensors(target_dir):
+      raise RuntimeError(
+        f"Download finished but no '.safetensors' files were found directly under '{target_dir}'. "
+        f"Ensure the repo '{hf_model}' contains safetensors at its top level."
+      )
+    _summarize_safetensors(target_dir)
+
+  # If in distributed mode, wait for rank 0 to complete
+  if world_size > 1 and world_rank != 0:
+    _log(f"Rank {world_rank} waiting for model download to complete...", prefix='[Model] ')
+    # Simple file-based synchronization - wait for safetensors to appear
+    max_wait = 7200  # 2 hours max wait
+    start_wait = time.time()
+    while not _has_safetensors(target_dir):
+      if time.time() - start_wait > max_wait:
+        raise RuntimeError(f"Timeout waiting for model files in '{target_dir}'")
+      time.sleep(5)
+    _log(f"Rank {world_rank} detected model files are ready.", prefix='[Model] ')
+
+  # Final verification
+  if not _has_safetensors(target_dir):
+    raise RuntimeError(
+      f"Model files are still not visible in '{target_dir}' after download. "
+      f"Please check filesystem permissions and shared storage visibility."
+    )
+  return target_dir
+
+# Resolve (and if needed, fetch) the model BEFORE tutel initialization
+model_id = _ensure_local_model(args.path_to_model, args.hf_model)
+_log(f"[INFO] Discover the model from local path: {model_id}, chosen as the default model.")
+
+# NOW initialize tutel after model is ready
 try:
   from tutel import system, net
 
@@ -98,108 +345,6 @@ def master_print(*args, **kwargs):
   if world_rank == 0:
      print(*args, **kwargs, file=sys.stderr)
 
-# ---------- New: local model bootstrap & HF CLI handling ----------
-
-def _has_safetensors(dir_path: str) -> bool:
-  try:
-    return os.path.isdir(dir_path) and any(f.endswith('.safetensors') for f in os.listdir(dir_path))
-  except FileNotFoundError:
-    return False
-
-def _safe_remove_dir_contents(dir_path: str):
-  """Remove everything under dir_path safely (leave the directory itself)."""
-  abs_path = os.path.abspath(dir_path)
-  if abs_path in ('/', ''):
-    raise RuntimeError(f"Refusing to remove contents of unsafe path: '{abs_path}'")
-  if not os.path.isdir(abs_path):
-    return
-  for entry in os.listdir(abs_path):
-    full = os.path.join(abs_path, entry)
-    try:
-      if os.path.isfile(full) or os.path.islink(full):
-        os.unlink(full)
-      else:
-        shutil.rmtree(full)
-    except Exception as e:
-      master_print(f"[WARN] Failed to remove '{full}': {e}")
-
-def _ensure_latest_hf_cli(raise_on_error: bool):
-  """Upgrade to latest huggingface_hub[cli]."""
-  try:
-    cmd = [sys.executable, "-m", "pip", "install", "-U", "huggingface_hub[cli]"]
-    master_print(f"[INFO] Ensuring latest huggingface_hub[cli]: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
-  except Exception as e:
-    master_print(f"[WARN] Unable to upgrade huggingface_hub[cli]: {e}")
-    if raise_on_error:
-      raise
-
-def _find_hf_cli() -> str:
-  """Return the CLI executable name ('hf' preferred), or '' if not found."""
-  for candidate in ("hf", "huggingface-cli"):
-    if shutil.which(candidate):
-      return candidate
-  return ""
-
-def _download_with_hf_cli(repo_id: str, local_dir: str):
-  """Download entire repo into local_dir (no nested repo folder) using CLI."""
-  cli = _find_hf_cli()
-  if not cli:
-    # Final attempt: install then re-check
-    _ensure_latest_hf_cli(raise_on_error=True)
-    cli = _find_hf_cli()
-    if not cli:
-      raise RuntimeError("Hugging Face CLI not found even after installing huggingface_hub[cli].")
-
-  # Use explicit repo-type for clarity; default is 'model' for model repos.
-  cmd = [cli, "download", repo_id, "--repo-type", "model", "--local-dir", local_dir]
-  master_print(f"[INFO] Downloading model with CLI: {' '.join(cmd)}")
-  # Blocking download; will raise on non-zero exit.
-  subprocess.run(cmd, check=True)
-
-def _ensure_local_model(path_to_model: str, hf_model: str) -> str:
-  """Ensure model shards live directly in path_to_model; download if needed."""
-  target_dir = os.path.abspath(path_to_model)
-
-  # Step 0: ensure latest CLI (requested) – only rank 0 actually runs pip.
-  if world_rank == 0:
-    _ensure_latest_hf_cli(raise_on_error=False)
-  peer_barrier()
-
-  # Step 1: if usable local model exists, short-circuit.
-  if _has_safetensors(target_dir):
-    master_print(f"[INFO] Found existing model shards in '{target_dir}'. Using local files.")
-    return target_dir
-
-  # Step 2: prepare directory (create or wipe).
-  if world_rank == 0:
-    if os.path.isdir(target_dir):
-      master_print(f"[INFO] No .safetensors found in '{target_dir}'. Cleaning it before download.")
-      _safe_remove_dir_contents(target_dir)
-    os.makedirs(target_dir, exist_ok=True)
-
-    # Step 3: download to local dir (no global cache pollution).
-    _download_with_hf_cli(hf_model, target_dir)
-
-    # Step 4: verify presence of safetensors in the target root.
-    if not _has_safetensors(target_dir):
-      raise RuntimeError(
-        f"Download finished but no '.safetensors' files were found directly under '{target_dir}'. "
-        f"Ensure the repo '{hf_model}' contains safetensors at its top level."
-      )
-
-  # Step 5: sync all ranks and re-verify.
-  peer_barrier()
-  if not _has_safetensors(target_dir):
-    raise RuntimeError(
-      f"Model files are still not visible in '{target_dir}' after download. "
-      f"Please check filesystem permissions and shared storage visibility."
-    )
-  return target_dir
-
-# Resolve (and if needed, fetch) the model locally, then proceed.
-model_id = _ensure_local_model(args.path_to_model, args.hf_model)
-master_print(f"[INFO] Discover the model from local path: {model_id}, chosen as the default model.")
 # -----------------------------------------------------------------
 
 tokenizer = AutoTokenizer.from_pretrained(f'{model_id}', trust_remote_code=True)
