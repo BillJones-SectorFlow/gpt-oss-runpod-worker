@@ -80,41 +80,77 @@ async def check_openwebui_health() -> bool:
         return False
 
 
-async def log_subprocess_output(process):
-    """Read and log subprocess output in real-time using async I/O."""
+async def log_subprocess_output_improved(process):
+    """
+    Improved subprocess output reader that handles both stdout and stderr
+    with better buffering and real-time streaming.
+    """
     try:
-        loop = asyncio.get_event_loop()
-        while True:
-            # Check if process has terminated
-            if process.poll() is not None:
-                break
-                
-            # Try to read output non-blocking
+        # Create a queue for output lines
+        output_queue = asyncio.Queue()
+        
+        async def read_stream(stream, stream_name):
+            """Read from a stream and put lines into the queue."""
             try:
-                # Run readline in executor without creating a task first
-                line = await asyncio.wait_for(
-                    loop.run_in_executor(None, process.stdout.readline),
-                    timeout=0.1
+                while True:
+                    # Read line asynchronously
+                    line = await stream.readline()
+                    if not line:
+                        break
+                    
+                    # Decode and strip the line
+                    decoded = line.decode('utf-8', errors='replace').strip()
+                    if decoded:
+                        await output_queue.put((stream_name, decoded))
+            except Exception as e:
+                logger.error(f"Error reading {stream_name}: {e}")
+            finally:
+                await output_queue.put((stream_name, None))  # Signal completion
+        
+        # Start readers for both stdout and stderr
+        stdout_task = asyncio.create_task(read_stream(process.stdout, 'stdout'))
+        stderr_task = asyncio.create_task(read_stream(process.stderr, 'stderr'))
+        
+        streams_done = {'stdout': False, 'stderr': False}
+        
+        # Process output from the queue
+        while not all(streams_done.values()):
+            try:
+                # Wait for output with timeout
+                stream_name, line = await asyncio.wait_for(
+                    output_queue.get(),
+                    timeout=1.0
                 )
                 
-                if line:
-                    line = line.strip()
-                    # Log the output from OpenWebUI
-                    logger.info(f"[OpenWebUI] {line}")
-                    
-                    # Look for percentage indicators in the output
-                    percent_match = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
-                    if percent_match:
-                        logger.info(f"[Model Loading Progress] {percent_match.group(0)}")
+                if line is None:
+                    streams_done[stream_name] = True
+                    continue
+                
+                # Log the output from OpenWebUI/Tutel
+                logger.info(f"[Tutel] {line}")
+                
+                # Look for percentage indicators in the output
+                percent_match = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
+                if percent_match:
+                    logger.info(f"[Model Loading Progress] {percent_match.group(0)}")
+                
+                # Look for specific markers
+                if "Model ready!" in line or "Start listening on" in line:
+                    logger.info("[Tutel] *** MODEL IS READY ***")
+                
             except asyncio.TimeoutError:
-                # No output available right now, continue
+                # No output for 1 second, continue waiting
                 continue
                 
+        # Wait for tasks to complete
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        
     except Exception as e:
-        logger.error(f"Error reading subprocess output: {e}")
+        logger.error(f"Error in output reader: {e}")
+
 
 async def start_openwebui_process():
-    """Start Tutel core server..."""
+    """Start Tutel core server with improved subprocess handling."""
     global openwebui_process, model_ready
     
     python_bin = sys.executable
@@ -123,50 +159,84 @@ async def start_openwebui_process():
         "--serve=core",
         "--listen_port", "8000",
     ]
+    
     logger.info(f"Starting Tutel core with command: {' '.join(cmd)}")
+    
     try:
         env = os.environ.copy()
         env["LD_LIBRARY_PATH"] = env.get("LD_LIBRARY_PATH", "") + ":/usr/lib/x86_64-linux-gnu"
         env.setdefault("NCCL_DEBUG", "INFO")
         env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+        env.setdefault("PYTHONUNBUFFERED", "1")  # Force unbuffered Python output
         env.setdefault("HF_HUB_OFFLINE", "0")
         env.setdefault("LOCAL_SIZE", os.getenv("LOCAL_SIZE", "1"))
-        openwebui_process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True,
-            preexec_fn=os.setsid,
+        
+        # Create subprocess with async pipes
+        openwebui_process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             env=env,
+            preexec_fn=os.setsid,  # Create new process group
+            limit=1024*1024  # 1MB buffer limit
         )
+        
         logger.info(f"Tutel process started with PID: {openwebui_process.pid}")
-        output_task = asyncio.create_task(log_subprocess_output(openwebui_process))
+        
+        # Start output reader task
+        output_task = asyncio.create_task(log_subprocess_output_improved(openwebui_process))
+        
+        # Wait for model to be ready
         elapsed = 0
+        last_health_check = 0
+        
         while elapsed < MODEL_STARTUP_TIMEOUT:
-            if openwebui_process.poll() is not None:
+            # Check if process has died
+            if openwebui_process.returncode is not None:
                 logger.error(f"Tutel process died with exit code: {openwebui_process.returncode}")
-                remaining_output = openwebui_process.stdout.read()
-                if remaining_output:
-                    logger.error(f"Final output: {remaining_output}")
+                
+                # Try to get any remaining output
+                try:
+                    await asyncio.wait_for(output_task, timeout=2.0)
+                except asyncio.TimeoutError:
+                    pass
+                
                 return False
-            if await check_openwebui_health():
-                model_ready = True
-                logger.info("Health check passed; waiting 2s to stabilize…")
-                await asyncio.sleep(2)
-                logger.info("Tutel is ready.")
-                return True
+            
+            # Perform health check every MODEL_CHECK_INTERVAL seconds
+            current_time = elapsed
+            if current_time - last_health_check >= MODEL_CHECK_INTERVAL:
+                if await check_openwebui_health():
+                    model_ready = True
+                    logger.info("Health check passed; model is ready!")
+                    
+                    # Let output reader continue running in background
+                    return True
+                last_health_check = current_time
+            
+            # Progress indicator
             percentage = (elapsed / MODEL_STARTUP_TIMEOUT) * 100
-            logger.info(f"Waiting for Tutel… ({elapsed}s elapsed, {percentage:.1f}% of timeout)")
-            await asyncio.sleep(MODEL_CHECK_INTERVAL)
-            elapsed += MODEL_CHECK_INTERVAL
+            if elapsed % 10 == 0:  # Log every 10 seconds
+                logger.info(f"Waiting for Tutel… ({elapsed}s elapsed, {percentage:.1f}% of timeout)")
+            
+            await asyncio.sleep(1)
+            elapsed += 1
+        
         logger.error(f"Tutel did not start within {MODEL_STARTUP_TIMEOUT} seconds")
+        
+        # Cancel output task
         output_task.cancel()
+        try:
+            await output_task
+        except asyncio.CancelledError:
+            pass
+        
         return False
+        
     except Exception as e:
         logger.error(f"Failed to start Tutel: {e}", exc_info=True)
         return False
+
 
 def shutdown_openwebui():
     """Gracefully shutdown the OpenWebUI process."""
@@ -177,19 +247,37 @@ def shutdown_openwebui():
         try:
             # Try graceful termination first
             os.killpg(os.getpgid(openwebui_process.pid), signal.SIGTERM)
-            openwebui_process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            logger.warning("OpenWebUI did not terminate gracefully, forcing kill")
+            
+            # Wait for process to terminate (async wait in sync context)
             try:
-                os.killpg(os.getpgid(openwebui_process.pid), signal.SIGKILL)
-            except:
-                openwebui_process.kill()
-            openwebui_process.wait()
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # If we're in an async context, create a task
+                    asyncio.create_task(openwebui_process.wait())
+                else:
+                    # If not, run it synchronously
+                    loop.run_until_complete(
+                        asyncio.wait_for(openwebui_process.wait(), timeout=10)
+                    )
+            except (asyncio.TimeoutError, RuntimeError):
+                logger.warning("OpenWebUI did not terminate gracefully, forcing kill")
+                try:
+                    os.killpg(os.getpgid(openwebui_process.pid), signal.SIGKILL)
+                except:
+                    openwebui_process.kill()
+                
+                # Wait for forced termination
+                try:
+                    loop = asyncio.get_event_loop()
+                    if not loop.is_running():
+                        loop.run_until_complete(openwebui_process.wait())
+                except:
+                    pass
+                    
         except Exception as e:
             logger.error(f"Error shutting down OpenWebUI: {e}")
             try:
                 openwebui_process.kill()
-                openwebui_process.wait()
             except:
                 pass
         finally:
