@@ -446,7 +446,7 @@ async def ping():
     if model_ready:
         return JSONResponse({"status": "healthy"}, status_code=status.HTTP_200_OK)
     else:
-        logger.debug("Received /ping request while model still loading.")
+        logger.info("Received /ping request while model still loading.")
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 @app.post("/v1/chat/completions")
