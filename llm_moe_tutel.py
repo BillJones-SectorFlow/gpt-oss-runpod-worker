@@ -29,7 +29,7 @@ parser.add_argument('--hf_model', type=str, default='openai/gpt-oss-120b',
 parser.add_argument('--path_to_model', type=str, default='/data/models/gpt-oss-120b',
                     help='Local directory where model files (.safetensors, config.json, tokenizer, etc.) should live')
 parser.add_argument('--max_seq_len', type=int, default=1024 * 128)
-parser.add_argument('--buffer_size', type=int, default=128)
+parser.add_argument('--buffer_size', type=int, default=256)
 parser.add_argument('--listen_port', type=int, default=8000)
 parser.add_argument("--serve", nargs="?", const='core', default=None)
 parser.add_argument('--prompt', type=str, default='')
@@ -69,7 +69,8 @@ torch.backends.cuda.matmul.allow_tf32 = True
 # ---------- New: local model bootstrap & HF CLI handling with verbose logging ----------
 
 def _ts():
-  return datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] + 'Z'
+  from datetime import timezone
+  return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] + 'Z'
 
 def _log(line: str, prefix: str = "", progress_pct: float = None):
   """Log with optional progress percentage for parent process detection."""
@@ -1006,7 +1007,12 @@ else:
   raise Exception(f'Unrecognized model type: {model_type}')
 
 _log(f"Loading model module: {module}", prefix='[STARTUP] ')
-exec(compile(open(module).read(), filename=module, mode='exec'))
+master_print(f"[MODULE] Executing model module: {module}")
+with open(module, 'r') as f:
+  module_code = f.read()
+  master_print(f"[MODULE] Module size: {len(module_code)} bytes")
+exec(compile(module_code, filename=module, mode='exec'))
+master_print(f"[MODULE] Module execution complete, forward_fn={'available' if 'forward_fn' in globals() else 'missing'}")
 
 logits = torch.zeros([batch, 1, token_emb.size(0)], dtype=torch.bfloat16, device=device)
 token_in = torch.ones([batch, 1], dtype=torch.int64, device=device)
@@ -1081,14 +1087,20 @@ def generate_partial(prompt_tokens, max_tokens=None, temperature=0, screen_displ
     peer_barrier()
     torch.cuda.synchronize()
     master_print('*******************************************************')
+    master_print(f'[GENERATE] Starting generation with {len(prompt_tokens)} prompt tokens, max_tokens={max_tokens}, temperature={temperature}')
     try:
-      master_print(tokenizer.decode(prompt_tokens).strip())
-    except:
-      master_print('Prompting ..')
+      decoded_prompt = tokenizer.decode(prompt_tokens).strip()
+      if len(decoded_prompt) > 500:
+        master_print(f'[GENERATE] Prompt preview: {decoded_prompt[:250]}...[{len(decoded_prompt)} chars total]...{decoded_prompt[-250:]}')
+      else:
+        master_print(f'[GENERATE] Prompt: {decoded_prompt}')
+    except Exception as e:
+      master_print(f'[GENERATE] Could not decode prompt: {e}')
     master_print('*******************************************************')
 
     t_start = time.perf_counter()
     last_token = []
+    generated_tokens = []
 
     def token_flush():
       decoded_word = tokenizer.decode(last_token)
@@ -1111,6 +1123,7 @@ def generate_partial(prompt_tokens, max_tokens=None, temperature=0, screen_displ
             next_token = torch.multinomial(torch.softmax(logits.view(batch * seq, -1) / temperature, dim=1), num_samples=batch * seq).view(batch, seq)
         token = next_token.contiguous()
         buffer_data[_] = token[-1]
+        generated_tokens.append(token[-1].item())
 
       visible_offset = max(0, visible_point - pos)
       pos += args.buffer_size
@@ -1137,6 +1150,14 @@ def generate_partial(prompt_tokens, max_tokens=None, temperature=0, screen_displ
           yield token_flush()
         break
     t_stop = time.perf_counter()
+    
+    master_print(f'[GENERATE] Generation complete: {len(generated_tokens)} tokens generated in {t_stop - t_start:.3f}s')
+    if generated_tokens and len(generated_tokens) < 500:
+      try:
+        generated_text = tokenizer.decode(generated_tokens)
+        master_print(f'[GENERATE] Generated text: {generated_text}')
+      except:
+        pass
 
   yield (t_stop - t_start), pos + 1
 
@@ -1240,9 +1261,12 @@ def router_fn(app):
         # Build messages for Harmony encoding
         messages = prompt_messages.get('messages', [])
         
+        master_print(f"[API] Processing request with {len(messages)} messages, reasoning_effort={reasoning_effort}")
+        
         # Use Harmony encoding for gpt-oss
         if model_type == 'gpt_oss' and (HAS_HARMONY or HAS_UNSLOTH):
           try:
+            master_print("[API] Using Harmony encoding for gpt-oss model")
             harmony_text = encode_conversations_harmony(
               messages=messages,
               reasoning_effort=reasoning_effort,
@@ -1254,8 +1278,10 @@ def router_fn(app):
             
             if harmony_text:
               tokens = tokenizer([harmony_text], return_tensors="pt")['input_ids'].view(-1)
+              master_print(f"[API] Harmony encoding successful, {tokens.numel()} tokens")
             else:
               # Fallback to basic encoding
+              master_print("[API] Harmony text empty, using fallback encoding")
               tokens = token_encode(
                 messages[-1]['content'] if messages else '',
                 system_prompt=messages[-2]['content'] if len(messages) > 1 and messages[-2].get('role') == 'system' else None,
@@ -1278,6 +1304,8 @@ def router_fn(app):
           )
         
         temperature = int(1000 * abs(float(prompt_messages.get('temperature', 0))))
+        
+        master_print(f"[API] Starting generation: prompt_tokens={tokens.numel()}, max_tokens={max_tokens}, temperature={temperature/1000.0}")
 
         await background_cleanup()
         prompt_cnt[0] = tokens.numel()
@@ -1288,9 +1316,13 @@ def router_fn(app):
 
         req_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
+        
+        # Store the actual prompt token count
+        actual_prompt_tokens = tokens.numel()
 
         # For streaming with Harmony parsing
         if enable_stream and HAS_HARMONY and model_type == 'gpt_oss':
+          master_print("[API] Streaming with Harmony parsing enabled")
           encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
           parser = StreamableParser(encoding, role=Role.ASSISTANT)
           
@@ -1360,6 +1392,7 @@ def router_fn(app):
           
         else:
           # Non-Harmony streaming or non-streaming
+          master_print(f"[API] {'Streaming' if enable_stream else 'Non-streaming'} without Harmony parsing")
           app.task_pool = generate_partial(tokens.to(device), max_tokens=max_tokens, temperature=temperature, screen_display=not enable_stream)
           response_buffers = []
           
@@ -1388,36 +1421,75 @@ def router_fn(app):
               else:
                 response_buffers.append(response)
 
-        message_content = ''.join(response_buffers)
-        time_cost, total_tokens = response
+        # Join all response buffers first
+        raw_message_content = ''.join(response_buffers)
+        time_cost, total_generated_positions = response
+        
+        master_print(f"[API] Generation complete: total_positions={total_generated_positions}, raw_content_length={len(raw_message_content)}")
+        
+        # Calculate actual completion tokens based on what was generated
+        # The total_generated_positions includes the prompt, so subtract prompt tokens
+        actual_completion_tokens = total_generated_positions - actual_prompt_tokens
         
         # Parse final response with Harmony if available and it's gpt-oss
         reasoning = None
-        if HAS_HARMONY and model_type == 'gpt_oss' and not enable_stream:
+        message_content = raw_message_content  # Default to raw content
+        
+        if HAS_HARMONY and model_type == 'gpt_oss' and raw_message_content:
           try:
+            master_print("[API] Parsing response with Harmony for reasoning/final channels")
             encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
             parser = StreamableParser(encoding, role=Role.ASSISTANT)
-            token_ids = tokenizer.encode(message_content, add_special_tokens=False)
+            
+            # Tokenize the raw generated content to get token IDs
+            token_ids = tokenizer.encode(raw_message_content, add_special_tokens=False)
+            master_print(f"[API] Parsing {len(token_ids)} tokens for channels")
+            
             for tid in token_ids:
               parser.process(int(tid))
             
             # Extract reasoning and final content
             reasoning_texts = []
             final_text = ""
+            
             for m in parser.messages:
               if m.channel == "analysis":
                 reasoning_texts.extend([c.text for c in m.content])
               elif m.channel == "final":
                 final_text += "".join(c.text for c in m.content)
             
+            # If parser is still in a channel, get remaining content
+            if parser.current_channel == "final" and parser.current_content:
+              final_text += parser.current_content
+            elif parser.current_channel == "analysis" and parser.current_content:
+              reasoning_texts.append(parser.current_content)
+            
+            master_print(f"[API] Harmony parsing: found {len(reasoning_texts)} reasoning chunks, final_text_length={len(final_text)}")
+            
             if reasoning_texts:
               reasoning = "\n".join(reasoning_texts)
+            
+            # Use parsed final text if available, otherwise fall back to raw content
             if final_text:
               message_content = final_text
+            else:
+              master_print("[API] No final channel content found, using raw content")
+              message_content = raw_message_content
+              
           except Exception as e:
             master_print(f"[WARNING] Failed to parse Harmony channels: {e}")
+            master_print(f"[WARNING] Using raw content as fallback")
+            message_content = raw_message_content
 
-        usage = {"prompt_tokens": prompt_cnt[0].item(), "completion_tokens": total_tokens - prompt_cnt[0].item(), "total_tokens": total_tokens}
+        # Build usage with corrected token counts
+        usage = {
+            "prompt_tokens": actual_prompt_tokens,
+            "completion_tokens": actual_completion_tokens,
+            "total_tokens": actual_prompt_tokens + actual_completion_tokens
+        }
+        
+        master_print(f"[API] Final usage: prompt={usage['prompt_tokens']}, completion={usage['completion_tokens']}, total={usage['total_tokens']}")
+        
         message = {"role": "assistant", "content": message_content}
         if reasoning:
           message["reasoning"] = reasoning
