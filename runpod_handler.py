@@ -125,14 +125,13 @@ async def log_subprocess_output_improved(process):
                 if line is None:
                     streams_done[stream_name] = True
                     continue
-                
-                # Log the output from OpenWebUI/Tutel
-                logger.info(f"[Tutel] {line}")
-                
+
                 # Look for percentage indicators in the output
                 percent_match = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
-                if percent_match:
+                if percent_match and "oading" in line:
                     logger.info(f"[Model Loading Progress] {percent_match.group(0)}")
+                else:
+                    logger.info(f"[Tutel] {line}")
                 
                 # Look for specific markers
                 if "Model ready!" in line or "Start listening on" in line:
