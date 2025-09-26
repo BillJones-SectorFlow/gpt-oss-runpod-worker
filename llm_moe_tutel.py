@@ -559,7 +559,7 @@ model_id = _ensure_local_model(args.path_to_model, args.hf_model)
 _log(f"[INFO] Discover the model from local path: {model_id}, chosen as the default model.")
 
 # NOW initialize tutel after model is ready
-_log("Initializing Tutel distributed framework...", prefix='[STARTUP] ')
+_log("Initializing Tutel framework...", prefix='[STARTUP] ')
 try:
   from tutel import system, net
 
@@ -606,7 +606,7 @@ try:
     peer_barrier()
     return torch.from_numpy(np.load(path))
 except:
-  assert int(os.environ.get('WORLD_SIZE', 1)) == 1, "Failed to initialize distributed session"
+  assert int(os.environ.get('WORLD_SIZE', 1)) == 1, "Failed to tutel session"
   import autort
   world_rank, world_size = 0, 1
   device = autort.device()
