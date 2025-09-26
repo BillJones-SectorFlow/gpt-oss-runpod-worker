@@ -1487,6 +1487,8 @@ def router_fn(app):
             "completion_tokens": actual_completion_tokens,
             "total_tokens": actual_prompt_tokens + actual_completion_tokens
         }
+
+        total_tokens = actual_prompt_tokens + actual_completion_tokens
         
         master_print(f"[API] Final usage: prompt={usage['prompt_tokens']}, completion={usage['completion_tokens']}, total={usage['total_tokens']}")
         
