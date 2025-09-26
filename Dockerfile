@@ -7,6 +7,10 @@ WORKDIR /app
 # Install Python dependencies for the RunPod handler and curl for the entrypoint script
 RUN pip install requests runpod && apt-get update && apt-get install -y curl
 
+# Python deps
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
 # Copy the RunPod handler script into the container
 COPY runpod_handler.py /app/runpod_handler.py
 
