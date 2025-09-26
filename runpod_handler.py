@@ -1,3 +1,5 @@
+# runpod_handler.py
+
 import os
 import re
 import logging
@@ -496,7 +498,7 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
                                     OPENWEBUI_INTERNAL_API_URL,
                                     json=openai_payload,
                                     headers=headers,
-                                    timeout=httpx.Timeout(60.0, connect=10.0),  # More specific timeout
+                                    timeout=httpx.Timeout(600.0, connect=10.0),  # More specific timeout
                                 ) as r:
                                     r.raise_for_status()
                                     async for chunk in r.aiter_bytes():
@@ -522,7 +524,7 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
             return StreamingResponse(iter_openwebui_stream(), media_type="text/event-stream")
 
         else:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
                 response = await client.post(
                     OPENWEBUI_INTERNAL_API_URL,
                     json=openai_payload,
