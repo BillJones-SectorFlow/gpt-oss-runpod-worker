@@ -1,3 +1,5 @@
+# llm_moe_tutel.py
+
 #!/usr/bin/env python3
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
@@ -591,6 +593,16 @@ try:
       raise Exception(f'Antares kernels are not properly configured for OP_LOADER at: {op_loader_path}')
   parallel_env = system.init_data_model_parallel(backend='gloo')
   world_rank, world_size = parallel_env.global_rank, parallel_env.global_size
+
+  # Wait for CUDA to be available
+  max_wait = 300  # 5 minutes max
+  start_wait = time.time()
+  while not torch.cuda.is_available():
+      if time.time() - start_wait > max_wait:
+          raise RuntimeError("Timeout waiting for CUDA to become available")
+      time.sleep(1)
+  _log("CUDA is available, proceeding with initialization.", prefix='[STARTUP] ')
+
   device = torch.device('cuda', parallel_env.local_rank)
   torch.cuda.set_device(device)
   peer_barrier = lambda: net.simple_all_reduce(torch.ones([1], dtype=torch.int32))
@@ -606,9 +618,19 @@ try:
     peer_barrier()
     return torch.from_numpy(np.load(path))
 except:
-  assert int(os.environ.get('WORLD_SIZE', 1)) == 1, "Failed to tutel session"
+  assert int(os.environ.get('WORLD_SIZE', 1)) == 1, "Failed to initialize tutel session"
   import autort
   world_rank, world_size = 0, 1
+
+  # Wait for CUDA to be available
+  max_wait = 300  # 5 minutes max
+  start_wait = time.time()
+  while not torch.cuda.is_available():
+      if time.time() - start_wait > max_wait:
+          raise RuntimeError("Timeout waiting for CUDA to become available")
+      time.sleep(1)
+  _log("CUDA is available, proceeding with initialization.", prefix='[STARTUP] ')
+
   device = autort.device()
   peer_barrier = lambda: None
 
