@@ -1094,8 +1094,8 @@ def benchmark(use_ones=False, n_steps=100):
     exit(0)
 
 
-def generate_partial(prompt_tokens, max_tokens=None, temperature=0, screen_display=True):
-  max_tokens = max_tokens or args.max_seq_len
+def generate_partial(prompt_tokens, max_tokens=0, temperature=0, screen_display=True):
+  effective_max = len(prompt_tokens) + max_tokens
   temperature /= 1000.0
 
   progress_mask = ['\r-', '\r\\', '\r|', '\r/']
@@ -1133,8 +1133,9 @@ def generate_partial(prompt_tokens, max_tokens=None, temperature=0, screen_displ
         sys.stderr.flush()
       return decoded_word
 
-    while pos < max_tokens:
-      for _ in range(args.buffer_size):
+    while pos < effective_max:
+      buffer_len = min(args.buffer_size, effective_max - pos)
+      for _ in range(buffer_len):
         logits = forward(token, pos + _)
         if pos + _ + 1 < len(prompt_tokens):
           next_token = prompt_tokens[pos + _ + 1].view(batch, seq)
@@ -1143,17 +1144,17 @@ def generate_partial(prompt_tokens, max_tokens=None, temperature=0, screen_displ
             next_token = torch.argmax(logits, dim=-1).view(batch, seq)
           else:
             next_token = torch.multinomial(torch.softmax(logits.view(batch * seq, -1) / temperature, dim=1), num_samples=batch * seq).view(batch, seq)
+          generated_tokens.append(next_token[-1].item())
         token = next_token.contiguous()
         buffer_data[_] = token[-1]
-        generated_tokens.append(token[-1].item())
 
       visible_offset = max(0, visible_point - pos)
-      pos += args.buffer_size
+      pos += buffer_len
 
-      if visible_offset >= args.buffer_size:
+      if visible_offset >= buffer_len:
         continue
 
-      spill_tokens = buffer_data[visible_offset:].cpu().tolist()
+      spill_tokens = buffer_data[visible_offset:buffer_len].cpu().tolist()
       try:
         _ = spill_tokens.index(eos_token_id)
       except ValueError:
@@ -1181,7 +1182,7 @@ def generate_partial(prompt_tokens, max_tokens=None, temperature=0, screen_displ
       except:
         pass
 
-  yield (t_stop - t_start), pos + 1
+  yield (t_stop - t_start), pos
 
 def generate(*args, **kwargs):
   buffers = []
@@ -1262,7 +1263,6 @@ def router_fn(app):
     if len(prompt_messages) == 1 and 'text' in prompt_messages:
       prompt_messages = {"messages": [{"role": "user", "content": prompt_messages["text"]}]}
 
-    max_tokens = min(int(prompt_messages.get('max_tokens', args.max_seq_len)), args.max_seq_len)
     scope_route = request.scope.get("route").path
     enable_stream = (scope_route != "/v1/chat/completions") or prompt_messages.get('stream', False)
     reasoning_effort = prompt_messages.get('reasoning_effort', 'low')
@@ -1323,8 +1323,10 @@ def router_fn(app):
             messages[-1]['content'] if messages else '',
             system_prompt=messages[-2]['content'] if len(messages) > 1 and messages[-2].get('role') == 'system' else None,
             reasoning_effort=reasoning_effort
-          )
+            )
         
+        avail_context = max(0, args.max_seq_len - tokens.numel())
+        max_tokens = min(int(prompt_messages.get('max_tokens', avail_context)), avail_context)
         temperature = int(1000 * abs(float(prompt_messages.get('temperature', 0))))
         
         master_print(f"[API] Starting generation: prompt_tokens={tokens.numel()}, max_tokens={max_tokens}, temperature={temperature/1000.0}")
@@ -1414,7 +1416,10 @@ def router_fn(app):
           
         else:
           # Non-Harmony streaming or non-streaming
-          master_print(f"[API] {'Streaming' if enable_stream else 'Non-streaming'} without Harmony parsing")
+          if model_type == 'gpt_oss' and HAS_HARMONY:
+            master_print("[API] Non-streaming (parsing with Harmony post-generation if applicable)")
+          else:
+            master_print(f"[API] {'Streaming' if enable_stream else 'Non-streaming'} without Harmony parsing")
           app.task_pool = generate_partial(tokens.to(device), max_tokens=max_tokens, temperature=temperature, screen_display=not enable_stream)
           response_buffers = []
           
@@ -1445,13 +1450,13 @@ def router_fn(app):
 
         # Join all response buffers first
         raw_message_content = ''.join(response_buffers)
-        time_cost, total_generated_positions = response
+        time_cost, pos = response
         
-        master_print(f"[API] Generation complete: total_positions={total_generated_positions}, raw_content_length={len(raw_message_content)}")
+        master_print(f"[API] Generation complete: total_positions={pos}, raw_content_length={len(raw_message_content)}")
         
         # Calculate actual completion tokens based on what was generated
         # The total_generated_positions includes the prompt, so subtract prompt tokens
-        actual_completion_tokens = total_generated_positions - actual_prompt_tokens
+        actual_completion_tokens = max(0, pos - actual_prompt_tokens)
         
         # Parse final response with Harmony if available and it's gpt-oss
         reasoning = None
