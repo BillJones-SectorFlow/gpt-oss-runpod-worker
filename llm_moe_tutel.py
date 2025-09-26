@@ -1134,6 +1134,7 @@ def generate_partial(prompt_tokens, max_tokens=0, temperature=0, screen_display=
       return decoded_word
 
     while pos < effective_max:
+      master_print(f'[GENERATE] Progress: pos={pos}/{effective_max}, generated={len(generated_tokens)} tokens')
       buffer_len = min(args.buffer_size, effective_max - pos)
       for _ in range(buffer_len):
         logits = forward(token, pos + _)
@@ -1323,7 +1324,7 @@ def router_fn(app):
             messages[-1]['content'] if messages else '',
             system_prompt=messages[-2]['content'] if len(messages) > 1 and messages[-2].get('role') == 'system' else None,
             reasoning_effort=reasoning_effort
-            )
+          )
         
         avail_context = max(0, args.max_seq_len - tokens.numel())
         max_tokens = min(int(prompt_messages.get('max_tokens', avail_context)), avail_context)
