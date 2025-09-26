@@ -12,6 +12,7 @@ import subprocess
 import shutil
 import threading
 from datetime import datetime
+from typing import Any, Dict, List, Optional, Union
 
 # Force unbuffered output for better subprocess communication
 sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
@@ -43,6 +44,25 @@ try:
 except Exception as ex:
     raise Exception(f'Failed to import submodules({ex}), please install the client with:\n\n  >> {sys.executable} -m pip install "huggingface_hub[cli]" "transformers" "safetensors"')
     exit(0)
+
+# Import Harmony support libraries
+try:
+    from openai_harmony import (
+        Author, ChannelConfig, Conversation, DeveloperContent, HarmonyEncodingName,
+        Message, ReasoningEffort, Role, SystemContent, TextContent, load_harmony_encoding,
+        StreamableParser
+    )
+    HAS_HARMONY = True
+except ImportError:
+    HAS_HARMONY = False
+    print("[WARNING] openai_harmony not installed. Install with: pip install openai-harmony", file=sys.stderr)
+
+# Try to import unsloth_zoo for alternative encoding
+try:
+    from unsloth_zoo import encode_conversations_with_harmony as unsloth_encode
+    HAS_UNSLOTH = True
+except Exception:
+    HAS_UNSLOTH = False
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -329,6 +349,209 @@ def _ensure_local_model(path_to_model: str, hf_model: str) -> str:
     )
   return target_dir
 
+# ======== Harmony Encoding/Decoding Functions ========
+
+REASONING_EFFORT_MAP = {
+    "high": "HIGH",
+    "medium": "MEDIUM",
+    "low": "LOW",
+}
+
+def normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Normalize OpenAI 'messages' to `{"role": "...", "content": "..."}` strings.
+    If content is a list, join text parts and include simple placeholders for non-text parts.
+    """
+    norm: List[Dict[str, str]] = []
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if isinstance(content, list):
+            parts = []
+            for p in content:
+                t = p.get("type")
+                if t == "text" and p.get("text"):
+                    parts.append(p["text"])
+                elif t == "image_url":
+                    url = p.get("image_url")
+                    if isinstance(url, str):
+                        parts.append(f"[image: {url}]")
+                    elif isinstance(url, dict) and url.get("url"):
+                        parts.append(f"[image: {url['url']}]")
+                elif t == "input_audio":
+                    parts.append("[audio]")
+            content = "\n".join(parts)
+        elif not isinstance(content, str):
+            content = str(content)
+        norm.append({"role": role, "content": content})
+    return norm
+
+def encode_conversations_harmony(
+    messages: List[Dict[str, Any]],
+    reasoning_effort: str = "medium",
+    add_generation_prompt: bool = True,
+    developer_instructions: Optional[str] = None,
+    model_identity: Optional[str] = "You are ChatGPT, a large language model trained by OpenAI.",
+    prefer_unsloth: bool = False,
+) -> str:
+    """
+    Returns a single Harmony-rendered **string** ready for tokenizer.encode().
+    Priority:
+      1) unsloth_zoo.encode_conversations_with_harmony (if available & prefer_unsloth)
+      2) Raw openai_harmony conversation rendering
+      3) Fallback to basic template if harmony not available
+    """
+    msgs = normalize_messages(messages)
+    
+    # Try unsloth first if preferred
+    if prefer_unsloth and HAS_UNSLOTH:
+        try:
+            return unsloth_encode(
+                messages=msgs,
+                reasoning_effort=reasoning_effort,
+                add_generation_prompt=add_generation_prompt,
+                tool_calls=None,
+                developer_instructions=developer_instructions,
+                model_identity=model_identity or "You are ChatGPT, a large language model trained by OpenAI.",
+            )
+        except Exception as e:
+            master_print(f"[WARNING] Unsloth encoding failed, falling back: {e}")
+    
+    # Try openai_harmony
+    if HAS_HARMONY:
+        try:
+            enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+            
+            # System
+            sys = SystemContent.new()
+            if model_identity:
+                sys = sys.with_model_identity(model_identity)
+            # Default the conversation start date
+            sys = sys.with_conversation_start_date(time.strftime("%Y-%m-%d"))
+            
+            # Map reasoning effort
+            reasoning_map = {
+                "high": ReasoningEffort.HIGH,
+                "medium": ReasoningEffort.MEDIUM,
+                "low": ReasoningEffort.LOW
+            }
+            sys = sys.with_reasoning_effort(reasoning_map.get(reasoning_effort, ReasoningEffort.MEDIUM))
+            
+            # Limit channels to analysis/final by default
+            ch = sys.channel_config
+            sys = sys.with_channel_config(ChannelConfig.require_channels([c for c in ch.valid_channels if c != "commentary"]))
+            sys_msg = Message.from_role_and_content(Role.SYSTEM, sys)
+            
+            # Developer (optional)
+            dev_msg = None
+            if developer_instructions:
+                dev = DeveloperContent.new().with_instructions(developer_instructions)
+                dev_msg = Message.from_role_and_content(Role.DEVELOPER, dev)
+            
+            # User/assistant history
+            conv_msgs: List[Message] = [sys_msg]
+            if dev_msg:
+                conv_msgs.append(dev_msg)
+                
+            for m in msgs:
+                role = m["role"]
+                text = m["content"]
+                if role == "assistant":
+                    conv_msgs.append(Message.from_role_and_content(Role.ASSISTANT, TextContent(text=text)).with_channel("final"))
+                elif role == "system":
+                    # convert to developer instructions for safety
+                    dev = DeveloperContent.new().with_instructions(text)
+                    conv_msgs.append(Message.from_role_and_content(Role.DEVELOPER, dev))
+                else:
+                    conv_msgs.append(Message.from_role_and_content(Role.USER, TextContent(text=text)))
+            
+            conversation = Conversation.from_messages(conv_msgs)
+            token_ids = enc.render_conversation_for_completion(conversation, Role.ASSISTANT)
+            # Convert back to text that the model tokenizer can re-encode
+            rendered = enc.decode(token_ids)
+            return rendered
+        except Exception as e:
+            master_print(f"[WARNING] Harmony encoding failed, using fallback: {e}")
+    
+    # Fallback to basic template (for models without harmony support)
+    return None  # Will trigger the old token_encode logic
+
+def format_final_chat_response(
+    *,
+    req_id: str,
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    content: str,
+    reasoning: Optional[str] = None
+) -> Dict[str, Any]:
+    """Format a final OpenAI-compatible chat completion response."""
+    created = int(time.time())
+    reasoning_details = []
+    if reasoning:
+        reasoning_details = [{
+            "type": "reasoning.text",
+            "text": reasoning,
+            "format": "unknown",
+            "index": 0
+        }]
+
+    return {
+        "id": req_id,
+        "provider": "TUTEL",
+        "model": model,
+        "object": "chat.completion",
+        "created": created,
+        "choices": [{
+            "index": 0,
+            "finish_reason": "stop",
+            "native_finish_reason": "stop",
+            "logprobs": None,
+            "message": {
+                "role": "assistant",
+                "content": content or "",
+                "refusal": None,
+                "reasoning": reasoning,
+                "reasoning_details": reasoning_details
+            }
+        }],
+        "usage": {
+            "prompt_tokens": int(prompt_tokens),
+            "completion_tokens": int(completion_tokens),
+            "total_tokens": int(prompt_tokens) + int(completion_tokens),
+            "prompt_tokens_details": None
+        }
+    }
+
+def format_streaming_chunk(
+    *,
+    req_id: str,
+    model: str,
+    created: int,
+    index: int,
+    reasoning_delta: Optional[str] = None,
+    content_delta: Optional[str] = None,
+    finish_reason: Optional[str] = None
+) -> Dict[str, Any]:
+    """Format a streaming chunk for OpenAI-compatible SSE."""
+    delta: Dict[str, Any] = {}
+    if reasoning_delta:
+        delta["reasoning"] = {"content": reasoning_delta}
+    if content_delta:
+        delta["content"] = content_delta
+
+    return {
+        "id": req_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": index,
+            "delta": delta,
+            "finish_reason": finish_reason
+        }]
+    }
+
 # Resolve (and if needed, fetch) the model BEFORE tutel initialization
 _log("Initializing model loading...", prefix='[STARTUP] ')
 model_id = _ensure_local_model(args.path_to_model, args.hf_model)
@@ -504,6 +727,9 @@ def world_slice(t, dim=0):
 
 master_print(f'Loading shared weights - 0.0% ..')
 
+# [ALL WEIGHT LOADING CODE REMAINS THE SAME]
+# ... [keeping all the existing weight loading code unchanged] ...
+
 if model_type in ('deepseek_v3', 'kimi_k2'):
  for k in state_dict:
   if k.startswith('model.layers.'):
@@ -593,11 +819,6 @@ elif model_type in ('gpt_oss'):
     continue
   if 'lm_head.weight' in k:
     param[k] = state_dict[k].contiguous().to(torch.bfloat16).to(device)
-    ''' original_size = param[k].size(1)
-    param[k] = pad_at_dim(param[k], 1, (param[k].size(1) + 127) // 128 * 128)
-    param[k], scale_inv = ops.to_float8_block(param[k])
-    param[k] = param[k].narrow(1, 0, original_size).contiguous()
-    param[k].scale_inv = scale_inv '''
     continue
   if '.sinks' in k:
     param[k] = world_slice(state_dict[k].contiguous().to(torch.bfloat16).to(device))
@@ -626,7 +847,6 @@ else:
 
 token_emb = param['model.embed_tokens.weight']
 gate_moe = [param.get(f'model.layers.{i}.mlp.gate.weight', param.get(f'model.layers.{i}.mlp.router.weight', None)) for i in range(n_layers)]
-
 
 def load_expert_weight(prefs, dim=None, dev='cpu'):
   if type(prefs) not in (tuple, list):
@@ -690,7 +910,6 @@ def load_expert_weight(prefs, dim=None, dev='cpu'):
     ws.meta_input = torch.cat(mi, dim=0).unsqueeze(0).to(dev)
     ws.meta_weight = torch.cat(mw, dim=0).unsqueeze(0).to(dev)
   return ws
-
 
 def load_experts():
   gate_up_p, down_p = [], []
@@ -788,7 +1007,6 @@ else:
 
 _log(f"Loading model module: {module}", prefix='[STARTUP] ')
 exec(compile(open(module).read(), filename=module, mode='exec'))
-
 
 logits = torch.zeros([batch, 1, token_emb.size(0)], dtype=torch.bfloat16, device=device)
 token_in = torch.ones([batch, 1], dtype=torch.int64, device=device)
@@ -929,13 +1147,40 @@ def generate(*args, **kwargs):
       buffers.append(_)
   return ''.join(buffers), *_
 
-def token_encode(user_prompt, system_prompt=None):
+def token_encode(user_prompt, system_prompt=None, reasoning_effort='low', enable_thinking=None):
+  """Enhanced token encoding with Harmony support for gpt-oss models."""
+  # For gpt_oss, try to use Harmony encoding
+  if model_type == 'gpt_oss' and (HAS_HARMONY or HAS_UNSLOTH):
+    try:
+      # Build messages list
+      messages = []
+      if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+      messages.append({"role": "user", "content": user_prompt})
+      
+      # Use Harmony encoding
+      harmony_text = encode_conversations_harmony(
+        messages=messages,
+        reasoning_effort=reasoning_effort,
+        add_generation_prompt=True,
+        developer_instructions=None,
+        model_identity="You are ChatGPT, a large language model trained by OpenAI.",
+        prefer_unsloth=True
+      )
+      
+      if harmony_text:
+        # Tokenize the Harmony-formatted text
+        return tokenizer([harmony_text], return_tensors="pt")['input_ids'].view(-1)
+    except Exception as e:
+      master_print(f"[WARNING] Harmony encoding failed, using fallback: {e}")
+  
+  # Fallback to basic template
   text = tokenizer.apply_chat_template(
       [{"role": "user", "content": user_prompt}] + ([] if system_prompt is None else [{"role": "system", "content": system_prompt}]),
       tokenize=False,
       add_generation_prompt=True,
-      reasoning_effort='low',
-      enable_thinking=not args.disable_thinking
+      reasoning_effort=reasoning_effort,
+      enable_thinking=enable_thinking if enable_thinking is not None else (not args.disable_thinking)
   )
   return tokenizer([text], return_tensors="pt")['input_ids'].view(-1)
 
@@ -943,6 +1188,8 @@ prompt_cnt = torch.empty([3], dtype=torch.int64)
 tokens_buf = torch.empty([args.max_seq_len], dtype=torch.int64)
 
 from fastapi import FastAPI, Request, Response
+import uuid
+import asyncio
 
 def router_fn(app):
   from fastapi.responses import StreamingResponse
@@ -954,7 +1201,6 @@ def router_fn(app):
   else:
     log_message = master_print
 
-  import asyncio
   app.global_lock = asyncio.Lock()
   app.model_name = "(Model) " + os.path.basename(model_id)
   app.task_pool = iter(set())
@@ -975,7 +1221,9 @@ def router_fn(app):
 
     max_tokens = min(int(prompt_messages.get('max_tokens', args.max_seq_len)), args.max_seq_len)
     scope_route = request.scope.get("route").path
-    enable_stream = (scope_route != "/v1/chat/completions")
+    enable_stream = (scope_route != "/v1/chat/completions") or prompt_messages.get('stream', False)
+    reasoning_effort = prompt_messages.get('reasoning_effort', 'low')
+    stream_reasoning = prompt_messages.get('stream_reasoning', enable_stream)
 
     async def background_cleanup():
       try:
@@ -989,18 +1237,46 @@ def router_fn(app):
 
     async def generate_data():
       async with app.global_lock:
-        prompt_system = None
-        for message in prompt_messages['messages'][-2:]:
-          if message.get('role', 'user') == 'system':
-            prompt_system = message['content']
-          else:
-            prompt_user = message['content']
-
-        if prompt_user.endswith('</chat_history>') and not prompt_messages['stream']:
-          yield json.dumps({})
-          return
-
-        tokens = token_encode(prompt_user.strip(), system_prompt=prompt_system)
+        # Build messages for Harmony encoding
+        messages = prompt_messages.get('messages', [])
+        
+        # Use Harmony encoding for gpt-oss
+        if model_type == 'gpt_oss' and (HAS_HARMONY or HAS_UNSLOTH):
+          try:
+            harmony_text = encode_conversations_harmony(
+              messages=messages,
+              reasoning_effort=reasoning_effort,
+              add_generation_prompt=True,
+              developer_instructions=prompt_messages.get('developer_instructions'),
+              model_identity=prompt_messages.get('model_identity', "You are ChatGPT, a large language model trained by OpenAI."),
+              prefer_unsloth=True
+            )
+            
+            if harmony_text:
+              tokens = tokenizer([harmony_text], return_tensors="pt")['input_ids'].view(-1)
+            else:
+              # Fallback to basic encoding
+              tokens = token_encode(
+                messages[-1]['content'] if messages else '',
+                system_prompt=messages[-2]['content'] if len(messages) > 1 and messages[-2].get('role') == 'system' else None,
+                reasoning_effort=reasoning_effort
+              )
+          except Exception as e:
+            master_print(f"[WARNING] Harmony encoding failed: {e}")
+            # Fallback
+            tokens = token_encode(
+              messages[-1]['content'] if messages else '',
+              system_prompt=messages[-2]['content'] if len(messages) > 1 and messages[-2].get('role') == 'system' else None,
+              reasoning_effort=reasoning_effort
+            )
+        else:
+          # Non-gpt_oss models or no Harmony
+          tokens = token_encode(
+            messages[-1]['content'] if messages else '',
+            system_prompt=messages[-2]['content'] if len(messages) > 1 and messages[-2].get('role') == 'system' else None,
+            reasoning_effort=reasoning_effort
+          )
+        
         temperature = int(1000 * abs(float(prompt_messages.get('temperature', 0))))
 
         await background_cleanup()
@@ -1010,31 +1286,173 @@ def router_fn(app):
         net.simple_broadcast(prompt_cnt)
         net.simple_broadcast(tokens)
 
-        app.task_pool = generate_partial(tokens.to(device), max_tokens=max_tokens, temperature=temperature, screen_display=not enable_stream)
-        response_buffers = []
-        for response in app.task_pool:
-          if isinstance(response, str):
-            if enable_stream:
-              if scope_route == "/chat":
-                yield response
-              else:
-                json_out = {"model": model_id + ":latest","message":{"role":"assistant","content": response},"done": False}
-                yield json.dumps(json_out) + '\n'
-              await asyncio.sleep(0)
-            else:
-              response_buffers.append(response)
+        req_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created = int(time.time())
 
-        message = { "role": "assistant", "content": ''.join(response_buffers)}
+        # For streaming with Harmony parsing
+        if enable_stream and HAS_HARMONY and model_type == 'gpt_oss':
+          encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+          parser = StreamableParser(encoding, role=Role.ASSISTANT)
+          
+          # Send initial chunk
+          if scope_route == "/v1/chat/completions":
+            # OpenAI format
+            header = {
+              "id": req_id,
+              "object": "chat.completion.chunk",
+              "model": model_id,
+              "created": created,
+              "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant"},
+                "finish_reason": None
+              }]
+            }
+            yield f"data: {json.dumps(header)}\n\n"
+          
+          app.task_pool = generate_partial(tokens.to(device), max_tokens=max_tokens, temperature=temperature, screen_display=not enable_stream)
+          response_buffers = []
+          total_completion_tokens = 0
+          
+          for response in app.task_pool:
+            if isinstance(response, str):
+              # Parse with Harmony for reasoning channels
+              token_ids = tokenizer.encode(response, add_special_tokens=False)
+              total_completion_tokens += len(token_ids)
+              
+              for tid in token_ids:
+                parser.process(int(tid))
+                
+                # Stream reasoning if in analysis channel and stream_reasoning is enabled
+                if stream_reasoning and parser.current_channel == "analysis":
+                  delta_text = parser.last_content_delta or ""
+                  if delta_text and scope_route == "/v1/chat/completions":
+                    payload = format_streaming_chunk(
+                      req_id=req_id,
+                      model=model_id,
+                      created=created,
+                      index=0,
+                      reasoning_delta=delta_text
+                    )
+                    yield f"data: {json.dumps(payload)}\n\n"
+                
+                # Stream final content
+                elif parser.current_channel == "final":
+                  delta_text = parser.last_content_delta or ""
+                  if delta_text:
+                    if scope_route == "/chat":
+                      yield delta_text
+                    elif scope_route == "/v1/chat/completions":
+                      payload = format_streaming_chunk(
+                        req_id=req_id,
+                        model=model_id,
+                        created=created,
+                        index=0,
+                        content_delta=delta_text
+                      )
+                      yield f"data: {json.dumps(payload)}\n\n"
+                    else:
+                      json_out = {"model": model_id + ":latest","message":{"role":"assistant","content": delta_text},"done": False}
+                      yield json.dumps(json_out) + '\n'
+              
+              await asyncio.sleep(0)
+              response_buffers.append(response)
+          
+        else:
+          # Non-Harmony streaming or non-streaming
+          app.task_pool = generate_partial(tokens.to(device), max_tokens=max_tokens, temperature=temperature, screen_display=not enable_stream)
+          response_buffers = []
+          
+          for response in app.task_pool:
+            if isinstance(response, str):
+              if enable_stream:
+                if scope_route == "/chat":
+                  yield response
+                elif scope_route == "/v1/chat/completions":
+                  json_out = {
+                    "id": req_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_id,
+                    "choices": [{
+                      "index": 0,
+                      "delta": {"content": response},
+                      "finish_reason": None
+                    }]
+                  }
+                  yield f"data: {json.dumps(json_out)}\n\n"
+                else:
+                  json_out = {"model": model_id + ":latest","message":{"role":"assistant","content": response},"done": False}
+                  yield json.dumps(json_out) + '\n'
+                await asyncio.sleep(0)
+              else:
+                response_buffers.append(response)
+
+        message_content = ''.join(response_buffers)
         time_cost, total_tokens = response
-        usage = {"total_tokens": total_tokens, "time_cost": time_cost}
+        
+        # Parse final response with Harmony if available and it's gpt-oss
+        reasoning = None
+        if HAS_HARMONY and model_type == 'gpt_oss' and not enable_stream:
+          try:
+            encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+            parser = StreamableParser(encoding, role=Role.ASSISTANT)
+            token_ids = tokenizer.encode(message_content, add_special_tokens=False)
+            for tid in token_ids:
+              parser.process(int(tid))
+            
+            # Extract reasoning and final content
+            reasoning_texts = []
+            final_text = ""
+            for m in parser.messages:
+              if m.channel == "analysis":
+                reasoning_texts.extend([c.text for c in m.content])
+              elif m.channel == "final":
+                final_text += "".join(c.text for c in m.content)
+            
+            if reasoning_texts:
+              reasoning = "\n".join(reasoning_texts)
+            if final_text:
+              message_content = final_text
+          except Exception as e:
+            master_print(f"[WARNING] Failed to parse Harmony channels: {e}")
+
+        usage = {"prompt_tokens": prompt_cnt[0].item(), "completion_tokens": total_tokens - prompt_cnt[0].item(), "total_tokens": total_tokens}
+        message = {"role": "assistant", "content": message_content}
+        if reasoning:
+          message["reasoning"] = reasoning
 
         log_message(f'\x1b[33;20m<<<< Complete {total_tokens} tokens in {time_cost:.3f} sec (Decode TPS = {total_tokens / time_cost:.3f}) >>>>\x1b[0m')
+        
         if scope_route == "/api/chat":
           json_out = {"model":model_id + ":latest","message": message,"done": True, "usage": usage}
           yield json.dumps(json_out)
         elif scope_route == "/v1/chat/completions":
-          json_out = {"id": model_id + ":latest", "choices": [{"index": 0, "finish_reason": "stop", "message": message}], "usage": usage}
-          yield json.dumps(json_out)
+          if enable_stream:
+            # Send finish chunk
+            end_payload = {
+              "id": req_id,
+              "object": "chat.completion.chunk",
+              "created": created,
+              "model": model_id,
+              "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+              }]
+            }
+            yield f"data: {json.dumps(end_payload)}\n\n"
+            yield "data: [DONE]\n\n"
+          else:
+            json_out = format_final_chat_response(
+              req_id=req_id,
+              model=model_id,
+              prompt_tokens=usage["prompt_tokens"],
+              completion_tokens=usage["completion_tokens"],
+              content=message_content,
+              reasoning=reasoning
+            )
+            yield json.dumps(json_out)
       yield '\n'
 
     return StreamingResponse(generate_data(), media_type="application/json") # background=BackgroundTask(background_cleanup)
