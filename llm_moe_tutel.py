@@ -28,8 +28,8 @@ parser.add_argument('--hf_model', type=str, default='openai/gpt-oss-120b',
                     help='Hugging Face repo id to download if local model is missing (e.g. openai/gpt-oss-120b)')
 parser.add_argument('--path_to_model', type=str, default='/data/models/gpt-oss-120b',
                     help='Local directory where model files (.safetensors, config.json, tokenizer, etc.) should live')
-parser.add_argument('--max_seq_len', type=int, default=1024 * 8)
-parser.add_argument('--buffer_size', type=int, default=32)
+parser.add_argument('--max_seq_len', type=int, default=1024 * 128)
+parser.add_argument('--buffer_size', type=int, default=128)
 parser.add_argument('--listen_port', type=int, default=8000)
 parser.add_argument("--serve", nargs="?", const='core', default=None)
 parser.add_argument('--prompt', type=str, default='')
