@@ -440,12 +440,11 @@ async def ping():
     """
     Readiness check endpoint.
     Returns 200 if model is ready, 204 if still loading.
-    """
-    logger.info("Received /ping request.")
+    """    
     if model_ready:
         return JSONResponse({"status": "healthy"}, status_code=status.HTTP_200_OK)
     else:
-        # 204 No Content should not have a body
+        logger.info("Received /ping request while model still loading.")
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 @app.post("/v1/chat/completions")
