@@ -31,9 +31,8 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------
 # The internal OpenWebUI is expected to run on port 8000 within the container
 # and exposes an OpenAI-compatible API at /v1/chat/completions
-OPENWEBUI_INTERNAL_API_URL = os.getenv(
-    "OPENWEBUI_INTERNAL_API_URL", "http://localhost:8000/v1/chat/completions"
-)
+LISTEN_PORT = int(os.getenv("LISTEN_PORT", "8000"))
+OPENWEBUI_INTERNAL_API_URL = f"http://localhost:{LISTEN_PORT}/v1/chat/completions"
 
 # Retrieve the internal API key set in the entrypoint.sh
 WEBUI_SECRET_KEY = os.getenv("WEBUI_SECRET_KEY", "rp-tutel-internal-key")
@@ -41,6 +40,16 @@ WEBUI_SECRET_KEY = os.getenv("WEBUI_SECRET_KEY", "rp-tutel-internal-key")
 # Model readiness configuration
 MODEL_STARTUP_TIMEOUT = int(os.getenv("MODEL_STARTUP_TIMEOUT", "600"))  # 10 minutes
 MODEL_CHECK_INTERVAL = int(os.getenv("MODEL_CHECK_INTERVAL", "5"))  # 5 seconds
+
+# Tutel configuration from env vars
+HF_MODEL = os.getenv("HF_MODEL", "openai/gpt-oss-120b")
+PATH_TO_MODEL = os.getenv("PATH_TO_MODEL", "/data/models/gpt-oss-120b")
+MAX_SEQ_LEN = os.getenv("MAX_SEQ_LEN", "131072")
+BUFFER_SIZE = os.getenv("BUFFER_SIZE", "256")
+SERVE = os.getenv("SERVE", "core")
+PROMPT = os.getenv("PROMPT", "")
+DISABLE_THINKING = os.getenv("DISABLE_THINKING", "false").lower() in ("true", "1", "yes")
+DISABLE_FP4 = os.getenv("DISABLE_FP4", "false").lower() in ("true", "1", "yes")
 
 # ------------------------------------------------------------
 # Global State
@@ -54,13 +63,13 @@ async def check_openwebui_health() -> bool:
     try:
         async with httpx.AsyncClient() as client:
             # First check if the service is up
-            response = await client.get("http://localhost:8000", timeout=5.0)
+            response = await client.get(f"http://localhost:{LISTEN_PORT}", timeout=5.0)
             if response.status_code >= 500:
                 return False
             
             # Try a simple completion to ensure model is actually ready
             test_payload = {
-                "model": "openai/gpt-oss-120b",
+                "model": HF_MODEL,
                 "messages": [{"role": "user", "content": "test"}],
                 "max_tokens": 1,
                 "stream": False
@@ -157,9 +166,20 @@ async def start_openwebui_process():
     python_bin = sys.executable
     cmd = [
         python_bin, "-u", "/opt/deepseek-tutel-accel/llm_moe_tutel.py",
-        "--serve=core",
-        "--listen_port", "8000",
     ]
+    
+    cmd.extend(["--serve", SERVE])
+    cmd.extend(["--listen_port", str(LISTEN_PORT)])
+    cmd.extend(["--hf_model", HF_MODEL])
+    cmd.extend(["--path_to_model", PATH_TO_MODEL])
+    cmd.extend(["--max_seq_len", MAX_SEQ_LEN])
+    cmd.extend(["--buffer_size", BUFFER_SIZE])
+    if PROMPT:
+        cmd.extend(["--prompt", PROMPT])
+    if DISABLE_THINKING:
+        cmd.extend(["--disable_thinking"])
+    if DISABLE_FP4:
+        cmd.extend(["--disable_fp4"])
     
     logger.info(f"Starting Tutel core with command: {' '.join(cmd)}")
     
