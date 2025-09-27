@@ -1210,7 +1210,7 @@ def token_encode(user_prompt, system_prompt=None, reasoning_effort='low', enable
         add_generation_prompt=True,
         developer_instructions=None,
         model_identity="You are ChatGPT, a large language model trained by OpenAI.",
-        prefer_unsloth=True
+        prefer_unsloth=False
       )
       
       if harmony_text:
@@ -1296,7 +1296,7 @@ def router_fn(app):
               add_generation_prompt=True,
               developer_instructions=prompt_messages.get('developer_instructions'),
               model_identity=prompt_messages.get('model_identity', "You are ChatGPT, a large language model trained by OpenAI."),
-              prefer_unsloth=True
+              prefer_unsloth=False
             )
             
             if harmony_text:
