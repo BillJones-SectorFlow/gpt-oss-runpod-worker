@@ -1,5 +1,3 @@
-# llm_moe_tutel.py
-
 #!/usr/bin/env python3
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
@@ -1094,9 +1092,11 @@ def benchmark(use_ones=False, n_steps=100):
     exit(0)
 
 
-def generate_partial(prompt_tokens, max_tokens=0, temperature=0, screen_display=True):
+def generate_partial(prompt_tokens, max_tokens=0, temperature=0, top_p=1.0, top_k=0, min_p=0.0, screen_display=True):
   effective_max = len(prompt_tokens) + max_tokens
   temperature /= 1000.0
+  top_p /= 1000.0
+  min_p /= 1000.0
 
   progress_mask = ['\r-', '\r\\', '\r|', '\r/']
 
@@ -1144,7 +1144,26 @@ def generate_partial(prompt_tokens, max_tokens=0, temperature=0, screen_display=
           if temperature <= 0:
             next_token = torch.argmax(logits, dim=-1).view(batch, seq)
           else:
-            next_token = torch.multinomial(torch.softmax(logits.view(batch * seq, -1) / temperature, dim=1), num_samples=batch * seq).view(batch, seq)
+            flat_logits = (logits / temperature).view(-1, logits.size(-1))
+            if top_k > 0:
+              k = min(top_k, flat_logits.size(-1))
+              topk_val = torch.topk(flat_logits, k, dim=-1)[0][..., -1, None]
+              flat_logits = torch.where(flat_logits < topk_val, float('-inf'), flat_logits)
+            probs = torch.softmax(flat_logits, dim=-1)
+            if top_p < 1.0 - 1e-6:
+              sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
+              cum_probs = torch.cumsum(sorted_probs, dim=-1)
+              sorted_mask = cum_probs > top_p
+              sorted_mask[..., 0].fill_(False)
+              sorted_mask[..., 1:] = sorted_mask[..., :-1]
+              mask = sorted_mask.gather(-1, sorted_idx)
+              probs = probs.masked_fill(mask, 0.0)
+              probs = probs / torch.clamp(probs.sum(-1, keepdim=True), min=1e-8)
+            if min_p > 1e-6:
+              mask = probs >= min_p
+              probs = probs.masked_fill(~mask, 0.0)
+              probs = probs / torch.clamp(probs.sum(-1, keepdim=True), min=1e-8)
+            next_token = torch.multinomial(probs, num_samples=probs.size(0)).view(batch, seq)
           generated_tokens.append(next_token[-1].item())
         token = next_token.contiguous()
         buffer_data[_] = token[-1]
@@ -1229,7 +1248,7 @@ def token_encode(user_prompt, system_prompt=None, reasoning_effort='low', enable
   )
   return tokenizer([text], return_tensors="pt")['input_ids'].view(-1)
 
-prompt_cnt = torch.empty([3], dtype=torch.int64)
+prompt_cnt = torch.empty([6], dtype=torch.int64)
 tokens_buf = torch.empty([args.max_seq_len], dtype=torch.int64)
 
 from fastapi import FastAPI, Request, Response
@@ -1328,14 +1347,20 @@ def router_fn(app):
         
         avail_context = max(0, args.max_seq_len - tokens.numel())
         max_tokens = min(int(prompt_messages.get('max_tokens', avail_context)), avail_context)
-        temperature = int(1000 * abs(float(prompt_messages.get('temperature', 0))))
+        temperature = float(prompt_messages.get('temperature', 1.0))
+        top_p = float(prompt_messages.get('top_p', 1.0))
+        top_k = int(prompt_messages.get('top_k', 0))
+        min_p = float(prompt_messages.get('min_p', 0.0))
         
-        master_print(f"[API] Starting generation: prompt_tokens={tokens.numel()}, max_tokens={max_tokens}, temperature={temperature/1000.0}")
+        master_print(f"[API] Starting generation: prompt_tokens={tokens.numel()}, max_tokens={max_tokens}, temperature={temperature}")
 
         await background_cleanup()
         prompt_cnt[0] = tokens.numel()
         prompt_cnt[1] = max_tokens
-        prompt_cnt[2] = temperature
+        prompt_cnt[2] = int(1000 * temperature)
+        prompt_cnt[3] = top_k
+        prompt_cnt[4] = int(1000 * top_p)
+        prompt_cnt[5] = int(1000 * min_p)
         net.simple_broadcast(prompt_cnt)
         net.simple_broadcast(tokens)
 
@@ -1367,7 +1392,7 @@ def router_fn(app):
             }
             yield f"data: {json.dumps(header)}\n\n"
           
-          app.task_pool = generate_partial(tokens.to(device), max_tokens=max_tokens, temperature=temperature, screen_display=not enable_stream)
+          app.task_pool = generate_partial(tokens.to(device), max_tokens=max_tokens, temperature=int(1000 * temperature), top_p=int(1000 * top_p), top_k=top_k, min_p=int(1000 * min_p), screen_display=not enable_stream)
           response_buffers = []
           total_completion_tokens = 0
           
@@ -1421,7 +1446,7 @@ def router_fn(app):
             master_print("[API] Non-streaming (parsing with Harmony post-generation if applicable)")
           else:
             master_print(f"[API] {'Streaming' if enable_stream else 'Non-streaming'} without Harmony parsing")
-          app.task_pool = generate_partial(tokens.to(device), max_tokens=max_tokens, temperature=temperature, screen_display=not enable_stream)
+          app.task_pool = generate_partial(tokens.to(device), max_tokens=max_tokens, temperature=int(1000 * temperature), top_p=int(1000 * top_p), top_k=top_k, min_p=int(1000 * min_p), screen_display=not enable_stream)
           response_buffers = []
           
           for response in app.task_pool:
@@ -1585,10 +1610,16 @@ Start listening on {addr}:{args.listen_port}. Request examples:
     with torch.no_grad():
       while True:
         net.simple_broadcast(prompt_cnt)
-        prompt_size, max_tokens, temperature = prompt_cnt.cpu().tolist()
+        params = prompt_cnt.cpu().tolist()
+        prompt_size = params[0]
+        max_tokens = params[1]
+        temperature = params[2] / 1000.0
+        top_k = params[3]
+        top_p = params[4] / 1000.0
+        min_p = params[5] / 1000.0
         tokens = tokens_buf.narrow(0, 0, prompt_size)
         net.simple_broadcast(tokens)
-        generate(tokens.to(device), max_tokens=max_tokens, temperature=temperature)
+        generate(tokens.to(device), max_tokens=max_tokens, temperature=int(1000 * temperature), top_p=int(1000 * top_p), top_k=top_k, min_p=int(1000 * min_p))
 
 if __name__ == '__main__':
   user_prompt = args.prompt.strip()
