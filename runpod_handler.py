@@ -372,9 +372,10 @@ class Message(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[Message]
-    temperature: float = Field(default=1.0, ge=0.0, le=2.0)
-    top_p: float = Field(default=1.0, ge=0.0, le=1.0)
-    top_k: int = Field(default=0, ge=0)
+    temperature: float = Field(default=float(os.getenv("TEMP", "1.0")), ge=0.0, le=2.0)
+    top_p: float = Field(default=float(os.getenv("TOP_P", "1.0")), ge=0.0, le=1.0)
+    top_k: int = Field(default=int(os.getenv("TOP_K", "0")), ge=0)
+    min_p: float = Field(default=float(os.getenv("MIN_P", "0.0")), ge=0.0, le=1.0)
     max_tokens: int = Field(default=32768, gt=0)
     stream: bool = False
     reasoning_effort: str = "high"
