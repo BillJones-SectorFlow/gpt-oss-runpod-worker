@@ -12,7 +12,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Copy the RunPod handler script into the container
-COPY runpod_handler.py /app/runpod_handler.py
+COPY handler.py /app/handler.py
 
 # Copy our custom entrypoint script
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
@@ -22,7 +22,7 @@ RUN rm -rf /opt/deepseek-tutel-accel/llm_moe_tutel.py
 COPY llm_moe_tutel.py /opt/deepseek-tutel-accel/llm_moe_tutel.py
 
 # Expose the port for OpenWebUI (which our handler will proxy to)
-EXPOSE 8000 80
+EXPOSE 80
 
 # Set our custom script as the new entrypoint
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
