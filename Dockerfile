@@ -28,4 +28,4 @@ EXPOSE 8000 80
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
 # The default command will be to start the RunPod handler
-CMD ["python", "-u", "/app/runpod_handler.py"]
+CMD ["python", "-u", "/app/handler.py"]
