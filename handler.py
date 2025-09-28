@@ -1,3 +1,5 @@
+# handler.py
+
 import os
 import re
 import logging
@@ -476,8 +478,8 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
     request_id = request.headers.get("X-Request-ID", "unknown")
     logger.info(f"[{request_id}] Received chat completion request for model: {chat_request.model}")
    
-    # Check if model is ready, wait up to 5 minutes
-    wait_timeout = 300  # 5 minutes
+    # Check if model is ready, wait up to CHAT_COMPLETION_TIMEOUT seconds
+    wait_timeout = int(os.getenv("CHAT_COMPLETION_TIMEOUT", "600"))  # seconds
     check_interval = 5  # seconds
     elapsed = 0
     while not model_ready and elapsed < wait_timeout:
