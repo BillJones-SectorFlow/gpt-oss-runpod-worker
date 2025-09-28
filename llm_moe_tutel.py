@@ -694,9 +694,14 @@ else:
 eos_token_id = int(os.environ.get('EOS_TOKEN_ID', eos_token_id))
 
 def load_to(filename, params):
-  with safe_open(f'{filename}', framework='pt') as f:
+  mmap_enabled = os.getenv("MMAP", "True").lower() in ("true", "1", "yes")
+  start_time = time.time()
+  _log(f"Starting load of {filename} to CPU RAM (mmap={mmap_enabled})", prefix='[Model-Load] ')
+  with safe_open(f'{filename}', framework='pt', mmap=mmap_enabled) as f:
     for k in f.keys():
       params[k] = f.get_tensor(k)
+  duration = time.time() - start_time
+  _log(f"Completed load of {filename} to CPU RAM in {duration:.3f}s", prefix='[Model-Load] ')
   return params
 
 param = {}
@@ -1036,7 +1041,11 @@ master_print(f"[MODULE] Executing model module: {module}")
 with open(module, 'r') as f:
   module_code = f.read()
   master_print(f"[MODULE] Module size: {len(module_code)} bytes")
-exec(compile(module_code, filename=module, mode='exec'))
+try:
+  exec(compile(module_code, filename=module, mode='exec'))
+except Exception as e:
+  master_print(f"Error executing model module: {e}")
+  exit(1)
 master_print(f"[MODULE] Module execution complete, forward_fn={'available' if 'forward_fn' in globals() else 'missing'}")
 
 logits = torch.zeros([batch, 1, token_emb.size(0)], dtype=torch.bfloat16, device=device)
@@ -1419,12 +1428,13 @@ def router_fn(app):
                 if stream_reasoning and parser.current_channel == "analysis":
                   delta_text = parser.last_content_delta or ""
                   if delta_text and scope_route == "/v1/chat/completions":
+                    delta = delta_text
                     payload = format_streaming_chunk(
                       req_id=req_id,
                       model=model_id,
                       created=created,
                       index=0,
-                      reasoning_delta=delta_text
+                      reasoning_delta=delta
                     )
                     yield f"data: {json.dumps(payload)}\n\n"
                 
@@ -1473,44 +1483,81 @@ def router_fn(app):
           app.task_pool = generate_partial(tokens.to(device), max_tokens=max_tokens, temperature=int(1000 * temperature), top_p=int(1000 * top_p), top_k=top_k, min_p=int(1000 * min_p), screen_display=not enable_stream)
           response_buffers = []
           
-          for response in app.task_pool:
-            if isinstance(response, str):
-              if enable_stream:
-                if scope_route == "/chat":
-                  yield response
-                elif scope_route == "/v1/chat/completions":
-                  json_out = {
-                    "id": req_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_id,
-                    "choices": [{
-                      "index": 0,
-                      "delta": {"content": response},
-                      "finish_reason": None
-                    }]
-                  }
-                  yield f"data: {json.dumps(json_out)}\n\n"
+          try:
+            for response in app.task_pool:
+              if isinstance(response, str):
+                if enable_stream:
+                  if scope_route == "/chat":
+                    yield response
+                  elif scope_route == "/v1/chat/completions":
+                    json_out = {
+                      "id": req_id,
+                      "object": "chat.completion.chunk",
+                      "created": created,
+                      "model": model_id,
+                      "choices": [{
+                        "index": 0,
+                        "delta": {"content": response},
+                        "finish_reason": None
+                      }]
+                    }
+                    yield f"data: {json.dumps(json_out)}\n\n"
+                  else:
+                    json_out = {"model": model_id + ":latest","message":{"role":"assistant","content": response},"done": False}
+                    yield json.dumps(json_out) + '\n'
+                  await asyncio.sleep(0)
                 else:
-                  json_out = {"model": model_id + ":latest","message":{"role":"assistant","content": response},"done": False}
-                  yield json.dumps(json_out) + '\n'
-                await asyncio.sleep(0)
-              else:
-                response_buffers.append(response)
-            else:
-              # The tuple with time_cost, pos, ttft
-              time_cost, pos, ttft = response
-              actual_completion_tokens = max(0, pos - actual_prompt_tokens)
-              total_tokens = actual_prompt_tokens + actual_completion_tokens
-              tps = round(total_tokens / time_cost, 2) if time_cost > 0 else 0
-              usage = {
-                  "prompt_tokens": actual_prompt_tokens,
-                  "completion_tokens": actual_completion_tokens,
-                  "total_tokens": total_tokens,
-                  "total_time": round(time_cost, 4),
-                  "ttft": round(ttft, 4),
-                  "tps": tps
-              }
+                  response_buffers.append(response)
+          except Exception as e:
+            master_print(f"[API] Error during generation: {e}")
+            # On error, attempt partial Harmony parse if applicable
+            if HAS_HARMONY and model_type == 'gpt_oss' and response_buffers:
+              try:
+                partial_raw = ''.join(response_buffers)
+                master_print("[API] Attempting partial Harmony parse on error")
+                encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+                parser = StreamableParser(encoding, role=Role.ASSISTANT)
+                token_ids = tokenizer.encode(partial_raw, add_special_tokens=False)
+                for tid in token_ids:
+                  parser.process(int(tid))
+                
+                # Yield partial final content
+                partial_content = ""
+                for m in parser.messages:
+                  if m.channel == "final":
+                    partial_content += "".join(c.text for c in m.content)
+                if parser.current_channel == "final" and parser.current_content:
+                  partial_content += parser.current_content
+                
+                if partial_content:
+                  if scope_route == "/v1/chat/completions":
+                    payload = format_streaming_chunk(
+                      req_id=req_id,
+                      model=model_id,
+                      created=created,
+                      index=0,
+                      content_delta=partial_content
+                    )
+                    yield f"data: {json.dumps(payload)}\n\n"
+                  else:
+                    yield partial_content
+              except Exception as pe:
+                master_print(f"[API] Partial parse failed: {pe}")
+
+          else:
+            # Normal completion, get time_cost etc.
+            time_cost, pos, ttft = response  # Assuming last yield is the tuple
+            actual_completion_tokens = max(0, pos - actual_prompt_tokens)
+            total_tokens = actual_prompt_tokens + actual_completion_tokens
+            tps = round(total_tokens / time_cost, 2) if time_cost > 0 else 0
+            usage = {
+                "prompt_tokens": actual_prompt_tokens,
+                "completion_tokens": actual_completion_tokens,
+                "total_tokens": total_tokens,
+                "total_time": round(time_cost, 4),
+                "ttft": round(ttft, 4),
+                "tps": tps
+            }
 
         # Join all response buffers first
         raw_message_content = ''.join(response_buffers)
@@ -1635,7 +1682,7 @@ Start listening on {addr}:{args.listen_port}. Request examples:
       import uvicorn
       app = FastAPI()
       FastAPI.router_fn(app)
-      uvicorn.run(app, host=addr, port=args.listen_port)
+      uvicorn.run(app, host=addr, port=args.listen_port, log_level="info")
   else:
     with torch.no_grad():
       while True:
@@ -1663,4 +1710,3 @@ if __name__ == '__main__':
      args.serve = "core"
   if args.serve is not None:
     serve()
-
