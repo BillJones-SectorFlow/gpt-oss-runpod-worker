@@ -694,13 +694,9 @@ else:
 eos_token_id = int(os.environ.get('EOS_TOKEN_ID', eos_token_id))
 
 def load_to(filename, params):
-  start_time = time.time()
-  _log(f"Starting load of {filename} to CPU RAM", prefix='[Model-Load] ')
   with safe_open(f'{filename}', framework='pt') as f:
     for k in f.keys():
       params[k] = f.get_tensor(k)
-  duration = time.time() - start_time
-  _log(f"Completed load of {filename} to CPU RAM in {duration:.3f}s", prefix='[Model-Load] ')
   return params
 
 param = {}
@@ -999,7 +995,6 @@ def load_experts():
 
   return gate_up_p, down_p
 
-_log("Loading expert weights...", prefix='[STARTUP] ')
 gate_up_p, down_p = load_experts()
 
 del state_dict
