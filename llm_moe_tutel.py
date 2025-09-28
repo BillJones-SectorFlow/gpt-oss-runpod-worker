@@ -694,10 +694,9 @@ else:
 eos_token_id = int(os.environ.get('EOS_TOKEN_ID', eos_token_id))
 
 def load_to(filename, params):
-  mmap_enabled = os.getenv("MMAP", "True").lower() in ("true", "1", "yes")
   start_time = time.time()
-  _log(f"Starting load of {filename} to CPU RAM (mmap={mmap_enabled})", prefix='[Model-Load] ')
-  with safe_open(f'{filename}', framework='pt', mmap=mmap_enabled) as f:
+  _log(f"Starting load of {filename} to CPU RAM", prefix='[Model-Load] ')
+  with safe_open(f'{filename}', framework='pt') as f:
     for k in f.keys():
       params[k] = f.get_tensor(k)
   duration = time.time() - start_time
