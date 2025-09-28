@@ -32,7 +32,7 @@ LISTEN_PORT = int(os.getenv("LISTEN_PORT", "8000"))
 TUTEL_INTERNAL_API_URL = f"http://localhost:{LISTEN_PORT}/v1/chat/completions"
 
 # Retrieve the internal API key set in the entrypoint.sh
-WEBUI_SECRET_KEY = os.getenv("WEBUI_SECRET_KEY", "rp-tutel-internal-key")
+TUTEL_INTERNAL_ONLY_KEY = os.getenv("TUTEL_INTERNAL_ONLY_KEY", "tutel-internal-key")
 
 # Model readiness configuration
 MODEL_STARTUP_TIMEOUT = int(os.getenv("MODEL_STARTUP_TIMEOUT", "600"))  # 10 minutes
@@ -52,11 +52,11 @@ DISABLE_FP4 = os.getenv("DISABLE_FP4", "false").lower() in ("true", "1", "yes")
 # Global State
 # ------------------------------------------------------------
 model_ready = False
-openwebui_process = None
+tutel_process = None
 startup_task = None
 
-async def check_openwebui_health() -> bool:
-    """Check if OpenWebUI is responding to health checks."""
+async def check_tutel_health() -> bool:
+    """Check if Tutel is responding to health checks."""
     try:
         async with httpx.AsyncClient() as client:
             # First check if the service is up
@@ -156,9 +156,9 @@ async def log_subprocess_output_improved(process):
         logger.error(f"Error in output reader: {e}")
 
 
-async def start_openwebui_process():
+async def start_tutel_process():
     """Start Tutel core server with improved subprocess handling."""
-    global openwebui_process, model_ready
+    global tutel_process, model_ready
     
     python_bin = sys.executable
     cmd = [
@@ -190,7 +190,7 @@ async def start_openwebui_process():
         env.setdefault("LOCAL_SIZE", os.getenv("LOCAL_SIZE", "1"))
         
         # Create subprocess with async pipes
-        openwebui_process = await asyncio.create_subprocess_exec(
+        tutel_process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -199,10 +199,10 @@ async def start_openwebui_process():
             limit=1024*1024  # 1MB buffer limit
         )
         
-        logger.info(f"Tutel process started with PID: {openwebui_process.pid}")
+        logger.info(f"Tutel process started with PID: {tutel_process.pid}")
         
         # Start output reader task
-        output_task = asyncio.create_task(log_subprocess_output_improved(openwebui_process))
+        output_task = asyncio.create_task(log_subprocess_output_improved(tutel_process))
         
         # Wait for model to be ready
         elapsed = 0
@@ -210,8 +210,8 @@ async def start_openwebui_process():
         
         while elapsed < MODEL_STARTUP_TIMEOUT:
             # Check if process has died
-            if openwebui_process.returncode is not None:
-                logger.error(f"Tutel process died with exit code: {openwebui_process.returncode}")
+            if tutel_process.returncode is not None:
+                logger.error(f"Tutel process died with exit code: {tutel_process.returncode}")
                 
                 # Try to get any remaining output
                 try:
@@ -224,7 +224,7 @@ async def start_openwebui_process():
             # Perform health check every MODEL_CHECK_INTERVAL seconds
             current_time = elapsed
             if current_time - last_health_check >= MODEL_CHECK_INTERVAL:
-                if await check_openwebui_health():
+                if await check_tutel_health():
                     model_ready = True
                     logger.info("Health check passed; model is ready!")
                     
@@ -256,50 +256,50 @@ async def start_openwebui_process():
         return False
 
 
-def shutdown_openwebui():
-    """Gracefully shutdown the OpenWebUI process."""
-    global openwebui_process
+def shutdown_tutel():
+    """Gracefully shutdown the Tutel process."""
+    global tutel_process
     
-    if openwebui_process:
-        logger.info(f"Shutting down OpenWebUI process (PID: {openwebui_process.pid})")
+    if tutel_process:
+        logger.info(f"Shutting down Tutel process (PID: {tutel_process.pid})")
         try:
             # Try graceful termination first
-            os.killpg(os.getpgid(openwebui_process.pid), signal.SIGTERM)
+            os.killpg(os.getpgid(tutel_process.pid), signal.SIGTERM)
             
             # Wait for process to terminate (async wait in sync context)
             try:
                 loop = asyncio.get_event_loop()
                 if loop.is_running():
                     # If we're in an async context, create a task
-                    asyncio.create_task(openwebui_process.wait())
+                    asyncio.create_task(tutel_process.wait())
                 else:
                     # If not, run it synchronously
                     loop.run_until_complete(
-                        asyncio.wait_for(openwebui_process.wait(), timeout=10)
+                        asyncio.wait_for(tutel_process.wait(), timeout=10)
                     )
             except (asyncio.TimeoutError, RuntimeError):
-                logger.warning("OpenWebUI did not terminate gracefully, forcing kill")
+                logger.warning("Tutel did not terminate gracefully, forcing kill")
                 try:
-                    os.killpg(os.getpgid(openwebui_process.pid), signal.SIGKILL)
+                    os.killpg(os.getpgid(tutel_process.pid), signal.SIGKILL)
                 except:
-                    openwebui_process.kill()
+                    tutel_process.kill()
                 
                 # Wait for forced termination
                 try:
                     loop = asyncio.get_event_loop()
                     if not loop.is_running():
-                        loop.run_until_complete(openwebui_process.wait())
+                        loop.run_until_complete(tutel_process.wait())
                 except:
                     pass
                     
         except Exception as e:
-            logger.error(f"Error shutting down OpenWebUI: {e}")
+            logger.error(f"Error shutting down Tutel: {e}")
             try:
-                openwebui_process.kill()
+                tutel_process.kill()
             except:
                 pass
         finally:
-            openwebui_process = None
+            tutel_process = None
 
 
 # ------------------------------------------------------------
@@ -312,8 +312,8 @@ async def lifespan(app: FastAPI):
     
     logger.info("FastAPI application startup.")
     
-    # Start the OpenWebUI process asynchronously
-    startup_task = asyncio.create_task(start_openwebui_process())
+    # Start the Tutel process asynchronously
+    startup_task = asyncio.create_task(start_tutel_process())
     
     # Don't wait for it to complete - let the server start immediately
     # The task will run in the background
@@ -330,11 +330,11 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
     
-    # Shutdown OpenWebUI process
-    shutdown_openwebui()
+    # Shutdown Tutel process
+    shutdown_tutel()
 
 
-app = FastAPI(title="OpenWebUI Proxy Load Balancer", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Tutel Proxy Load Balancer", version="1.0.0", lifespan=lifespan)
 
 # ------------------------------------------------------------
 # Pydantic Models (OpenAI-compatible and permissive)
@@ -384,8 +384,8 @@ class ChatCompletionRequest(BaseModel):
 
 def _build_headers() -> Dict[str, str]:
     headers: Dict[str, str] = {"Content-Type": "application/json"}
-    if WEBUI_SECRET_KEY:
-        headers["Authorization"] = f"Bearer {WEBUI_SECRET_KEY}"
+    if TUTEL_INTERNAL_ONLY_KEY:
+        headers["Authorization"] = f"Bearer {TUTEL_INTERNAL_ONLY_KEY}"
     return headers
 
 
@@ -435,9 +435,9 @@ def _flatten_content_parts_to_text(content: Union[str, List[Any]]) -> str:
     return "\n".join([p for p in parts_out if p]).strip()
 
 
-def _normalize_for_openwebui(chat_request: ChatCompletionRequest) -> Dict[str, Any]:
+def _normalize_for_tutel(chat_request: ChatCompletionRequest) -> Dict[str, Any]:
     """
-    Build the payload for OpenWebUI/Tutel, flattening list-style 'content' into strings.
+    Build the payload for Tutel, flattening list-style 'content' into strings.
     """
     payload: Dict[str, Any] = chat_request.model_dump(exclude_none=True)
 
@@ -470,7 +470,7 @@ async def ping():
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, chat_request: ChatCompletionRequest):
     """
-    Proxies chat completion requests to the OpenWebUI instance.
+    Proxies chat completion requests to the Tutel instance.
     Returns 503 if model is not ready yet after waiting.
     """
     request_id = request.headers.get("X-Request-ID", "unknown")
@@ -500,11 +500,11 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
     headers = _build_headers()
 
     try:
-        # NORMALIZE: flatten list content into plain text for OpenWebUI/Tutel
-        openai_payload: Dict[str, Any] = _normalize_for_openwebui(chat_request)
+        # NORMALIZE: flatten list content into plain text for Tutel
+        openai_payload: Dict[str, Any] = _normalize_for_tutel(chat_request)
 
         if chat_request.stream:
-            async def iter_openwebui_stream():
+            async def iter_tutel_stream():
                 try:
                     async with httpx.AsyncClient() as client:
                         # Add retry logic for streaming requests
@@ -538,8 +538,8 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
                     error_msg = f"data: {{\"error\": \"Streaming failed: {str(e)}\"}}\n\n"
                     yield error_msg.encode()
 
-            logger.info(f"[{request_id}] Streaming response from OpenWebUI.")
-            return StreamingResponse(iter_openwebui_stream(), media_type="text/event-stream")
+            logger.info(f"[{request_id}] Streaming response from Tutel.")
+            return StreamingResponse(iter_tutel_stream(), media_type="text/event-stream")
 
         else:
             async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
@@ -549,7 +549,7 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
                     headers=headers,
                 )
                 response.raise_for_status()
-                logger.info(f"[{request_id}] Non-streaming response from OpenWebUI.")
+                logger.info(f"[{request_id}] Non-streaming response from Tutel.")
                 return JSONResponse(content=response.json())
 
     except ValidationError as e:
@@ -567,27 +567,27 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
         )
 
     except httpx.RequestError as e:
-        logger.error(f"[{request_id}] Error proxying request to OpenWebUI: {e}")
+        logger.error(f"[{request_id}] Error proxying request to Tutel: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
                 "error": {
-                    "message": f"Error communicating with OpenWebUI: {e}",
+                    "message": f"Error communicating with Tutel: {e}",
                     "type": "proxy_error",
-                    "code": "openwebui_connection_error",
+                    "code": "tutel_connection_error",
                 }
             },
         )
 
     except httpx.HTTPStatusError as e:
         body_text = e.response.text
-        logger.error(f"[{request_id}] OpenWebUI returned an error: {e.response.status_code} - {body_text}")
+        logger.error(f"[{request_id}] Tutel returned an error: {e.response.status_code} - {body_text}")
         raise HTTPException(
             status_code=e.response.status_code,
             detail={
                 "error": {
-                    "message": f"OpenWebUI returned an error: {body_text}",
-                    "type": "openwebui_error",
+                    "message": f"Tutel returned an error: {body_text}",
+                    "type": "tutel_error",
                     "code": f"http_status_{e.response.status_code}",
                 }
             },
@@ -614,7 +614,7 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
 def signal_handler(sig, frame):
     """Handle shutdown signals gracefully."""
     logger.info(f"Received signal {sig}, shutting down...")
-    shutdown_openwebui()
+    shutdown_tutel()
     sys.exit(0)
 
 
