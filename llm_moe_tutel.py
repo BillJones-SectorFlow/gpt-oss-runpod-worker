@@ -1,3 +1,4 @@
+```python
 #!/usr/bin/env python3
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
@@ -484,7 +485,10 @@ def format_final_chat_response(
     prompt_tokens: int,
     completion_tokens: int,
     content: str,
-    reasoning: Optional[str] = None
+    reasoning: Optional[str] = None,
+    total_time: float = 0.0,
+    ttft: float = 0.0,
+    tps: float = 0.0
 ) -> Dict[str, Any]:
     """Format a final OpenAI-compatible chat completion response."""
     created = int(time.time())
@@ -496,6 +500,8 @@ def format_final_chat_response(
             "format": "unknown",
             "index": 0
         }]
+
+    total_tokens = int(prompt_tokens) + int(completion_tokens)
 
     return {
         "id": req_id,
@@ -519,7 +525,10 @@ def format_final_chat_response(
         "usage": {
             "prompt_tokens": int(prompt_tokens),
             "completion_tokens": int(completion_tokens),
-            "total_tokens": int(prompt_tokens) + int(completion_tokens),
+            "total_tokens": total_tokens,
+            "total_time": round(total_time, 4),
+            "ttft": round(ttft, 4),
+            "tps": round(tps, 2),
             "prompt_tokens_details": None
         }
     }
@@ -747,9 +756,6 @@ def world_slice(t, dim=0):
   return out
 
 master_print(f'Loading shared weights - 0.0% ..')
-
-# [ALL WEIGHT LOADING CODE REMAINS THE SAME]
-# ... [keeping all the existing weight loading code unchanged] ...
 
 if model_type in ('deepseek_v3', 'kimi_k2'):
  for k in state_dict:
@@ -1120,7 +1126,9 @@ def generate_partial(prompt_tokens, max_tokens=0, temperature=0, top_p=1.0, top_
       master_print(f'[GENERATE] Could not decode prompt: {e}')
     master_print('*******************************************************')
 
+    ttft_start = time.perf_counter()
     t_start = time.perf_counter()
+    first_generated_time = None
     last_token = []
     generated_tokens = []
 
@@ -1164,6 +1172,8 @@ def generate_partial(prompt_tokens, max_tokens=0, temperature=0, top_p=1.0, top_
               probs = probs.masked_fill(~mask, 0.0)
               probs = probs / torch.clamp(probs.sum(-1, keepdim=True), min=1e-8)
             next_token = torch.multinomial(probs, num_samples=probs.size(0)).view(batch, seq)
+            if first_generated_time is None:
+                first_generated_time = time.perf_counter()
           generated_tokens.append(next_token[-1].item())
         token = next_token.contiguous()
         buffer_data[_] = token[-1]
@@ -1202,7 +1212,8 @@ def generate_partial(prompt_tokens, max_tokens=0, temperature=0, top_p=1.0, top_
       except:
         pass
 
-  yield (t_stop - t_start), pos
+    ttft = first_generated_time - ttft_start if first_generated_time is not None else (t_stop - t_start)
+    yield (t_stop - t_start), pos, ttft
 
 def generate(*args, **kwargs):
   buffers = []
@@ -1439,6 +1450,20 @@ def router_fn(app):
               
               await asyncio.sleep(0)
               response_buffers.append(response)
+            else:
+              # The tuple with time_cost, pos, ttft
+              time_cost, pos, ttft = response
+              actual_completion_tokens = max(0, pos - actual_prompt_tokens)
+              total_tokens = actual_prompt_tokens + actual_completion_tokens
+              tps = round(total_tokens / time_cost, 2) if time_cost > 0 else 0
+              usage = {
+                  "prompt_tokens": actual_prompt_tokens,
+                  "completion_tokens": actual_completion_tokens,
+                  "total_tokens": total_tokens,
+                  "total_time": round(time_cost, 4),
+                  "ttft": round(ttft, 4),
+                  "tps": tps
+              }
           
         else:
           # Non-Harmony streaming or non-streaming
@@ -1473,16 +1498,25 @@ def router_fn(app):
                 await asyncio.sleep(0)
               else:
                 response_buffers.append(response)
+            else:
+              # The tuple with time_cost, pos, ttft
+              time_cost, pos, ttft = response
+              actual_completion_tokens = max(0, pos - actual_prompt_tokens)
+              total_tokens = actual_prompt_tokens + actual_completion_tokens
+              tps = round(total_tokens / time_cost, 2) if time_cost > 0 else 0
+              usage = {
+                  "prompt_tokens": actual_prompt_tokens,
+                  "completion_tokens": actual_completion_tokens,
+                  "total_tokens": total_tokens,
+                  "total_time": round(time_cost, 4),
+                  "ttft": round(ttft, 4),
+                  "tps": tps
+              }
 
         # Join all response buffers first
         raw_message_content = ''.join(response_buffers)
-        time_cost, pos = response
         
         master_print(f"[API] Generation complete: total_positions={pos}, raw_content_length={len(raw_message_content)}")
-        
-        # Calculate actual completion tokens based on what was generated
-        # The total_generated_positions includes the prompt, so subtract prompt tokens
-        actual_completion_tokens = max(0, pos - actual_prompt_tokens)
         
         # Parse final response with Harmony if available and it's gpt-oss
         reasoning = None
@@ -1534,13 +1568,6 @@ def router_fn(app):
             master_print(f"[WARNING] Using raw content as fallback")
             message_content = raw_message_content
 
-        # Build usage with corrected token counts
-        usage = {
-            "prompt_tokens": actual_prompt_tokens,
-            "completion_tokens": actual_completion_tokens,
-            "total_tokens": actual_prompt_tokens + actual_completion_tokens
-        }
-
         total_tokens = actual_prompt_tokens + actual_completion_tokens
         
         master_print(f"[API] Final usage: prompt={usage['prompt_tokens']}, completion={usage['completion_tokens']}, total={usage['total_tokens']}")
@@ -1549,14 +1576,14 @@ def router_fn(app):
         if reasoning:
           message["reasoning"] = reasoning
 
-        log_message(f'\x1b[33;20m<<<< Complete {total_tokens} tokens in {time_cost:.3f} sec (Decode TPS = {total_tokens / time_cost:.3f}) >>>>\x1b[0m')
+        log_message(f'\x1b[33;20m<<<< Complete {total_tokens} tokens in {time_cost:.3f} sec (Decode TPS = {tps:.3f}) >>>>\x1b[0m')
         
         if scope_route == "/api/chat":
           json_out = {"model":model_id + ":latest","message": message,"done": True, "usage": usage}
           yield json.dumps(json_out)
         elif scope_route == "/v1/chat/completions":
           if enable_stream:
-            # Send finish chunk
+            # Send finish chunk with usage
             end_payload = {
               "id": req_id,
               "object": "chat.completion.chunk",
@@ -1565,7 +1592,8 @@ def router_fn(app):
               "choices": [{
                 "index": 0,
                 "delta": {},
-                "finish_reason": "stop"
+                "finish_reason": "stop",
+                "usage": usage
               }]
             }
             yield f"data: {json.dumps(end_payload)}\n\n"
@@ -1577,7 +1605,10 @@ def router_fn(app):
               prompt_tokens=usage["prompt_tokens"],
               completion_tokens=usage["completion_tokens"],
               content=message_content,
-              reasoning=reasoning
+              reasoning=reasoning,
+              total_time=time_cost,
+              ttft=ttft,
+              tps=tps
             )
             yield json.dumps(json_out)
       yield '\n'
@@ -1619,13 +1650,13 @@ Start listening on {addr}:{args.listen_port}. Request examples:
         min_p = params[5] / 1000.0
         tokens = tokens_buf.narrow(0, 0, prompt_size)
         net.simple_broadcast(tokens)
-        generate(tokens.to(device), max_tokens=max_tokens, temperature=int(1000 * temperature), top_p=int(1000 * top_p), top_k=top_k, min_p=int(1000 * min_p))
+        _ = generate(tokens.to(device), max_tokens=max_tokens, temperature=int(1000 * temperature), top_p=int(1000 * top_p), top_k=top_k, min_p=int(1000 * min_p), screen_display=True)
 
 if __name__ == '__main__':
   user_prompt = args.prompt.strip()
   master_print()
   if user_prompt:
-    generate(token_encode(user_prompt).to(device))
+    _ = generate(token_encode(user_prompt).to(device))
     master_print()
   _log("Running benchmarks...", prefix='[STARTUP] ')
   benchmark()
@@ -1633,3 +1664,4 @@ if __name__ == '__main__':
      args.serve = "core"
   if args.serve is not None:
     serve()
+```
