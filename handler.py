@@ -1,5 +1,3 @@
-# runpod_handler.py
-
 import os
 import re
 import logging
@@ -29,10 +27,9 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
-# The internal OpenWebUI is expected to run on port 8000 within the container
-# and exposes an OpenAI-compatible API at /v1/chat/completions
+# The tutel script exposes an OpenAI-compatible API at /v1/chat/completions
 LISTEN_PORT = int(os.getenv("LISTEN_PORT", "8000"))
-OPENWEBUI_INTERNAL_API_URL = f"http://localhost:{LISTEN_PORT}/v1/chat/completions"
+TUTEL_INTERNAL_API_URL = f"http://localhost:{LISTEN_PORT}/v1/chat/completions"
 
 # Retrieve the internal API key set in the entrypoint.sh
 WEBUI_SECRET_KEY = os.getenv("WEBUI_SECRET_KEY", "rp-tutel-internal-key")
@@ -77,7 +74,7 @@ async def check_openwebui_health() -> bool:
             
             headers = _build_headers()
             test_response = await client.post(
-                OPENWEBUI_INTERNAL_API_URL,
+                TUTEL_INTERNAL_API_URL,
                 json=test_payload,
                 headers=headers,
                 timeout=10.0
@@ -516,7 +513,7 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
                             try:
                                 async with client.stream(
                                     "POST",
-                                    OPENWEBUI_INTERNAL_API_URL,
+                                    TUTEL_INTERNAL_API_URL,
                                     json=openai_payload,
                                     headers=headers,
                                     timeout=httpx.Timeout(600.0, connect=10.0),  # More specific timeout
@@ -547,7 +544,7 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
         else:
             async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
                 response = await client.post(
-                    OPENWEBUI_INTERNAL_API_URL,
+                    TUTEL_INTERNAL_API_URL,
                     json=openai_payload,
                     headers=headers,
                 )
