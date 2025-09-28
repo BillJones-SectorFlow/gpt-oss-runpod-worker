@@ -1,4 +1,3 @@
-```python
 #!/usr/bin/env python3
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
@@ -1664,4 +1663,4 @@ if __name__ == '__main__':
      args.serve = "core"
   if args.serve is not None:
     serve()
-```
+
